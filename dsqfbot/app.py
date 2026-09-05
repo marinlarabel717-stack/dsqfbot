@@ -11,6 +11,7 @@ from zipfile import BadZipFile, ZipFile
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import AppConfig, load_config
@@ -52,7 +53,17 @@ class DsqfBotApp:
     async def render(self, update: Update, text: str, keyboard: InlineKeyboardMarkup | None = None) -> None:
         if update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.message.reply_text(text, reply_markup=keyboard)
+            message = update.callback_query.message
+            if message:
+                try:
+                    await message.edit_text(text, reply_markup=keyboard)
+                    return
+                except BadRequest as exc:
+                    if "Message is not modified" in str(exc):
+                        return
+                    LOGGER.warning("edit callback message failed: %s", exc)
+                    await message.reply_text(text, reply_markup=keyboard)
+                    return
         elif update.effective_message:
             await update.effective_message.reply_text(text, reply_markup=keyboard)
 
