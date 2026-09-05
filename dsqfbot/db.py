@@ -328,7 +328,12 @@ class Database:
             )
             return int(cur.lastrowid)
 
-    def list_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
+    def count_tasks(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COUNT(*) AS total FROM tasks").fetchone()
+        return int(row["total"] if row else 0)
+
+    def list_tasks(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
                 """
@@ -337,9 +342,9 @@ class Database:
                 JOIN groups ON groups.id = tasks.group_id
                 JOIN sessions ON sessions.id = tasks.session_id
                 ORDER BY tasks.id DESC
-                LIMIT ?
+                LIMIT ? OFFSET ?
                 """,
-                (limit,),
+                (limit, offset),
             ).fetchall()
         return [dict(row) for row in rows]
 

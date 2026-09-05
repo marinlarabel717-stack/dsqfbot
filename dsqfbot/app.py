@@ -22,6 +22,7 @@ from .utils import chunked, format_dt, now_iso, parse_links, parse_user_datetime
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger("dsqfbot")
 TELEGRAM_SCHEDULE_LIMIT = 100
+TASKS_PAGE_SIZE = 10
 
 
 class DsqfBotApp:
@@ -317,6 +318,18 @@ class DsqfBotApp:
                 payload["links"] = links
                 self.db.set_user_state(user_id, "wait_join_interval", payload)
                 await self.render(update, f"识别到 {len(links)} 个群链接，选一下加群间隔。", self.join_interval_keyboard())
+                return
+            if state == "wait_task_lookup":
+                if not text.isdigit():
+                    await self.render(update, "把要查看的任务编号发给我，例如：102", self.state_cancel_keyboard())
+                    return
+                task_id = int(text)
+                if not self.db.get_task(task_id):
+                    await self.render(update, "没找到这个任务编号，再发一次。", self.state_cancel_keyboard())
+                    return
+                self.db.clear_user_state(user_id)
+                return_page = int(payload.get("page", 0) or 0)
+                await self.render(update, self.task_detail_text(task_id), self.task_detail_keyboard(task_id, return_page))
                 return
             if state == "wait_schedule_message":
                 payload["message_text"] = text
@@ -717,17 +730,31 @@ class DsqfBotApp:
             if data == "tasks":
                 await self.render(update, self.tasks_text(), self.tasks_keyboard())
                 return
-            if data == "tasks:refresh":
-                await self.render(update, self.tasks_text(), self.tasks_keyboard())
+            if data.startswith("tasks:page:"):
+                page = self.parse_callback_page(data, "tasks:page:")
+                await self.render(update, self.tasks_text(page), self.tasks_keyboard(page))
+                return
+            if data.startswith("tasks:refresh"):
+                page = self.parse_callback_page(data, "tasks:refresh:")
+                await self.render(update, self.tasks_text(page), self.tasks_keyboard(page))
+                return
+            if data.startswith("tasks:pick"):
+                page = self.parse_callback_page(data, "tasks:pick:")
+                self.db.set_user_state(user_id, "wait_task_lookup", {"page": page})
+                await self.render(update, "把要查看的任务编号发给我。", self.state_cancel_keyboard())
                 return
             if data.startswith("task:view:"):
-                task_id = int(data.split(":")[-1])
-                await self.render(update, self.task_detail_text(task_id), self.task_detail_keyboard(task_id))
+                parts = data.split(":")
+                task_id = int(parts[2])
+                return_page = int(parts[3]) if len(parts) > 3 else 0
+                await self.render(update, self.task_detail_text(task_id), self.task_detail_keyboard(task_id, return_page))
                 return
             if data.startswith("task:delete:"):
-                task_id = int(data.split(":")[-1])
+                parts = data.split(":")
+                task_id = int(parts[2])
+                return_page = int(parts[3]) if len(parts) > 3 else 0
                 await self.delete_task(task_id)
-                await self.render(update, "任务已停用。", self.tasks_keyboard())
+                await self.render(update, f"任务已停用。\n\n{self.tasks_text(return_page)}", self.tasks_keyboard(return_page))
                 return
         except Exception as exc:
             LOGGER.exception("callback failed")
@@ -970,23 +997,57 @@ class DsqfBotApp:
         cutoff = datetime.now(tz=ZoneInfo(self.config.default_timezone)) - timedelta(minutes=1)
         return self.db.delete_completed_once_tasks(cutoff.isoformat())
 
-    def tasks_text(self) -> str:
+    @staticmethod
+    def parse_callback_page(data: str, prefix: str) -> int:
+        if not data.startswith(prefix):
+            return 0
+        raw = data.removeprefix(prefix).strip()
+        if not raw:
+            return 0
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
+
+    def task_page_items(self, page: int = 0) -> tuple[list[dict[str, Any]], int, int]:
         self.prune_completed_once_tasks()
-        tasks = self.db.list_tasks()
+        total = self.db.count_tasks()
+        if total <= 0:
+            return [], 0, 0
+        max_page = max(0, (total - 1) // TASKS_PAGE_SIZE)
+        current_page = max(0, min(page, max_page))
+        tasks = self.db.list_tasks(limit=TASKS_PAGE_SIZE, offset=current_page * TASKS_PAGE_SIZE)
+        return tasks, total, current_page
+
+    def tasks_text(self, page: int = 0) -> str:
+        tasks, total, current_page = self.task_page_items(page)
         if not tasks:
             return "还没有定时任务。"
-        lines = ["定时任务列表"]
+        total_pages = max(1, (total + TASKS_PAGE_SIZE - 1) // TASKS_PAGE_SIZE)
+        lines = [f"定时任务列表（第 {current_page + 1}/{total_pages} 页，共 {total} 条）", "点下方“查看任务”后，把任务编号发给我。"]
         for item in tasks:
             repeat_text = self.repeat_mode_text(item["repeat_mode"])
             lines.append(f"{item['id']}. {item['group_title']} | {format_dt(item['schedule_at'], self.config.default_timezone)} | {repeat_text} | {self.human_task_status(item['status'])}")
         return "\n".join(lines)
 
-    def tasks_keyboard(self) -> InlineKeyboardMarkup:
-        self.prune_completed_once_tasks()
-        tasks = self.db.list_tasks()
-        rows = [[InlineKeyboardButton(f"{item['id']}. {item['group_title'][:30]}", callback_data=f"task:view:{item['id']}")] for item in tasks[:20]]
-        rows.append([InlineKeyboardButton("刷新任务", callback_data="tasks:refresh")])
-        rows.append([InlineKeyboardButton("返回首页", callback_data="home")])
+    def tasks_keyboard(self, page: int = 0) -> InlineKeyboardMarkup:
+        tasks, total, current_page = self.task_page_items(page)
+        rows: list[list[InlineKeyboardButton]] = []
+        if tasks:
+            rows.append([InlineKeyboardButton("查看任务", callback_data=f"tasks:pick:{current_page}")])
+        nav_row: list[InlineKeyboardButton] = []
+        if current_page > 0:
+            nav_row.append(InlineKeyboardButton("上一页", callback_data=f"tasks:page:{current_page - 1}"))
+        if (current_page + 1) * TASKS_PAGE_SIZE < total:
+            nav_row.append(InlineKeyboardButton("下一页", callback_data=f"tasks:page:{current_page + 1}"))
+        if nav_row:
+            rows.append(nav_row)
+        rows.append(
+            [
+                InlineKeyboardButton("刷新任务", callback_data=f"tasks:refresh:{current_page}"),
+                InlineKeyboardButton("返回首页", callback_data="home"),
+            ]
+        )
         return InlineKeyboardMarkup(rows)
 
     def task_detail_text(self, task_id: int) -> str:
@@ -1059,11 +1120,11 @@ class DsqfBotApp:
             "failed": "失败",
         }.get(status, status)
 
-    def task_detail_keyboard(self, task_id: int) -> InlineKeyboardMarkup:
+    def task_detail_keyboard(self, task_id: int, return_page: int = 0) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("停用任务", callback_data=f"task:delete:{task_id}")],
-                [InlineKeyboardButton("返回任务列表", callback_data="tasks")],
+                [InlineKeyboardButton("停用任务", callback_data=f"task:delete:{task_id}:{max(0, return_page)}")],
+                [InlineKeyboardButton("返回任务列表", callback_data=f"tasks:page:{max(0, return_page)}")],
             ]
         )
 
