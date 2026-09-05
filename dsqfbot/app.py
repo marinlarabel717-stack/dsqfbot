@@ -966,7 +966,12 @@ class DsqfBotApp:
             ]
         )
 
+    def prune_completed_once_tasks(self) -> int:
+        cutoff = datetime.now(tz=ZoneInfo(self.config.default_timezone)) - timedelta(minutes=1)
+        return self.db.delete_completed_once_tasks(cutoff.isoformat())
+
     def tasks_text(self) -> str:
+        self.prune_completed_once_tasks()
         tasks = self.db.list_tasks()
         if not tasks:
             return "还没有定时任务。"
@@ -977,6 +982,7 @@ class DsqfBotApp:
         return "\n".join(lines)
 
     def tasks_keyboard(self) -> InlineKeyboardMarkup:
+        self.prune_completed_once_tasks()
         tasks = self.db.list_tasks()
         rows = [[InlineKeyboardButton(f"{item['id']}. {item['group_title'][:30]}", callback_data=f"task:view:{item['id']}")] for item in tasks[:20]]
         rows.append([InlineKeyboardButton("刷新任务", callback_data="tasks:refresh")])
@@ -984,6 +990,7 @@ class DsqfBotApp:
         return InlineKeyboardMarkup(rows)
 
     def task_detail_text(self, task_id: int) -> str:
+        self.prune_completed_once_tasks()
         item = self.db.get_task(task_id)
         if not item:
             return "任务不存在。"
@@ -1108,6 +1115,7 @@ class DsqfBotApp:
 
     async def repeat_worker(self) -> None:
         while True:
+            self.prune_completed_once_tasks()
             horizon = (datetime.utcnow() + timedelta(minutes=self.config.repeat_lookahead_minutes)).replace(microsecond=0).isoformat()
             for task in self.db.list_due_repeat_tasks(horizon):
                 session_row = self.db.get_session(task["session_id"])

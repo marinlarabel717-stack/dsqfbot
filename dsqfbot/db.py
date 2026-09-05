@@ -365,6 +365,17 @@ class Database:
         with self.connect() as conn:
             conn.execute(f"UPDATE tasks SET {keys} WHERE id = ?", (*fields.values(), task_id))
 
+    def delete_completed_once_tasks(self, cutoff_iso: str) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM tasks
+                WHERE repeat_mode='once' AND status='scheduled' AND schedule_at <= ?
+                """,
+                (cutoff_iso,),
+            )
+            return int(cur.rowcount or 0)
+
     def list_due_repeat_tasks(self, cutoff_iso: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
