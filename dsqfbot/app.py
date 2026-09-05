@@ -141,7 +141,7 @@ class DsqfBotApp:
             f"账号数：{len(sessions)}\n"
             f"群数量：{groups_count}\n"
             f"待处理加群：{len([job for job in self.db.list_join_jobs(50) if job['status'] in ('pending', 'retry', 'running')])}\n"
-            f"定时任务：{len(self.db.list_tasks(100))}"
+            f"定时任务：{self.db.count_tasks()}"
         )
         await self.render(update, text, self.home_keyboard())
 
