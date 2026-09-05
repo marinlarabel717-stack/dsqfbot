@@ -472,7 +472,7 @@ class DsqfBotApp:
                     return
                 result = await self.telethon.detect_group_status(session_row, group_row)
                 self.db.update_group(group_id, **result)
-                await self.render(update, "群状态已刷新。", self.group_detail_keyboard(group_id))
+                await self.render(update, self.group_detail_text(group_id), self.group_detail_keyboard(group_id))
                 return
             if data.startswith("group:schedule:"):
                 group_id = int(data.split(":")[-1])
