@@ -52,21 +52,24 @@ class DsqfBotApp:
         return True
 
     async def render(self, update: Update, text: str, keyboard: InlineKeyboardMarkup | None = None) -> None:
+        await self.render_message(update, text, keyboard)
+
+    async def render_message(self, update: Update, text: str, keyboard: InlineKeyboardMarkup | None = None) -> Any:
         if update.callback_query:
             await update.callback_query.answer()
             message = update.callback_query.message
             if message:
                 try:
                     await message.edit_text(text, reply_markup=keyboard)
-                    return
+                    return message
                 except BadRequest as exc:
                     if "Message is not modified" in str(exc):
-                        return
+                        return message
                     LOGGER.warning("edit callback message failed: %s", exc)
-                    await message.reply_text(text, reply_markup=keyboard)
-                    return
+                    return await message.reply_text(text, reply_markup=keyboard)
         elif update.effective_message:
-            await update.effective_message.reply_text(text, reply_markup=keyboard)
+            return await update.effective_message.reply_text(text, reply_markup=keyboard)
+        return None
 
     async def edit_message(self, message: Any, text: str, keyboard: InlineKeyboardMarkup | None = None) -> bool:
         if not message:
@@ -80,6 +83,32 @@ class DsqfBotApp:
             LOGGER.warning("edit message failed: %s", exc)
         except Exception as exc:
             LOGGER.warning("edit message failed: %s", exc)
+        return False
+
+    async def edit_message_ref(
+        self,
+        context: ContextTypes.DEFAULT_TYPE,
+        chat_id: int | None,
+        message_id: int | None,
+        text: str,
+        keyboard: InlineKeyboardMarkup | None = None,
+    ) -> bool:
+        if not chat_id or not message_id:
+            return False
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+            return True
+        except BadRequest as exc:
+            if "Message is not modified" in str(exc):
+                return True
+            LOGGER.warning("edit message by ref failed: %s", exc)
+        except Exception as exc:
+            LOGGER.warning("edit message by ref failed: %s", exc)
         return False
 
     def state_cancel_keyboard(self) -> InlineKeyboardMarkup:
@@ -312,9 +341,82 @@ class DsqfBotApp:
                     return
                 progress_state = {"created": 0, "total": 0, "last_when": when}
                 progress_message = None
+                progress_chat_id = payload.get("prompt_chat_id")
+                progress_message_id = payload.get("prompt_message_id")
                 try:
                     interval_minutes = self.interval_repeat_minutes(payload["repeat_mode"])
                     if interval_minutes is not None:
+                        initial_text = (
+                            "批量定时创建中：0/?\n"
+                            f"间隔：每 {interval_minutes} 分钟\n"
+                            "正在读取当前已设定时，并准备批量创建..."
+                        )
+
+                        async def update_progress_text(
+                            current_text: str,
+                            keyboard: InlineKeyboardMarkup | None = None,
+                        ) -> bool:
+                            if await self.edit_message_ref(
+                                context,
+                                progress_chat_id,
+                                progress_message_id,
+                                current_text,
+                                keyboard,
+                            ):
+                                return True
+                            return await self.edit_message(progress_message, current_text, keyboard)
+
+                        if not await update_progress_text(initial_text, self.state_cancel_keyboard()) and update.effective_message:
+                            progress_message = await update.effective_message.reply_text(
+                                initial_text,
+                                reply_markup=self.state_cancel_keyboard(),
+                            )
+                            progress_chat_id = getattr(progress_message, "chat_id", None)
+                            progress_message_id = getattr(progress_message, "message_id", None)
+
+                        async def report_progress_v2(created: int, total: int, current_when: datetime) -> None:
+                            progress_state["created"] = created
+                            progress_state["total"] = total
+                            progress_state["last_when"] = current_when
+                            if created not in {1, total} and created % 5 != 0:
+                                return
+                            await update_progress_text(
+                                (
+                                    f"批量定时创建中：{created}/{total}\n"
+                                    f"间隔：每 {interval_minutes} 分钟\n"
+                                    f"当前排到：{format_dt(current_when.isoformat(), self.config.default_timezone)}"
+                                ),
+                                self.state_cancel_keyboard(),
+                            )
+
+                        try:
+                            task_ids, total = await self.create_interval_schedule_batch(
+                                session_row=session_row,
+                                group_row=group_row,
+                                message_text=payload["message_text"],
+                                first_when=when,
+                                interval_minutes=interval_minutes,
+                                progress_callback=report_progress_v2,
+                            )
+                        except Exception as exc:
+                            message = self.telethon.describe_error(exc)
+                            self.db.update_group(group_row["id"], speak_status=message, last_error=message)
+                            failed_text = f"批量创建失败：已创建 {progress_state['created']} / {progress_state['total'] or '?'} 条。\n错误：{message}"
+                            if not await update_progress_text(failed_text):
+                                await self.render(update, failed_text)
+                            return
+
+                        self.db.clear_user_state(user_id)
+                        last_when = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
+                        final_text = (
+                            f"批量定时创建成功，共 {len(task_ids)} / {total} 条。\n"
+                            f"间隔：每 {interval_minutes} 分钟\n"
+                            f"开始：{format_dt(when.isoformat(), self.config.default_timezone)}\n"
+                            f"最后一条：{format_dt(last_when.isoformat(), self.config.default_timezone)}"
+                        )
+                        if not await update_progress_text(final_text, self.tasks_keyboard()):
+                            await self.render(update, final_text, self.tasks_keyboard())
+                        return
                         if update.effective_message:
                             progress_message = await update.effective_message.reply_text("正在读取当前已设定时，并准备批量创建…")
 
@@ -562,7 +664,11 @@ class DsqfBotApp:
                     )
                 else:
                     prompt = f"把发送时间发给我，格式：2026-09-06 10:30\n当前重复：{self.repeat_mode_text(repeat_mode)}"
-                await self.render(update, prompt, self.state_cancel_keyboard())
+                prompt_message = await self.render_message(update, prompt, self.state_cancel_keyboard())
+                if prompt_message:
+                    payload["prompt_chat_id"] = getattr(prompt_message, "chat_id", None)
+                    payload["prompt_message_id"] = getattr(prompt_message, "message_id", None)
+                    self.db.set_user_state(user_id, "wait_schedule_time", payload)
                 return
             if data == "join:setup":
                 payload = {"session_ids": [], "distribution": "balanced"}
