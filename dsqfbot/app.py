@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from zipfile import BadZipFile, ZipFile
 from zoneinfo import ZoneInfo
 
@@ -67,6 +67,20 @@ class DsqfBotApp:
                     return
         elif update.effective_message:
             await update.effective_message.reply_text(text, reply_markup=keyboard)
+
+    async def edit_message(self, message: Any, text: str, keyboard: InlineKeyboardMarkup | None = None) -> bool:
+        if not message:
+            return False
+        try:
+            await message.edit_text(text, reply_markup=keyboard)
+            return True
+        except BadRequest as exc:
+            if "Message is not modified" in str(exc):
+                return True
+            LOGGER.warning("edit message failed: %s", exc)
+        except Exception as exc:
+            LOGGER.warning("edit message failed: %s", exc)
+        return False
 
     def state_cancel_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([[InlineKeyboardButton("取消当前流程", callback_data="state:cancel")]])
@@ -296,28 +310,49 @@ class DsqfBotApp:
                     self.db.clear_user_state(user_id)
                     await self.render(update, "账号或群不存在。")
                     return
+                progress_state = {"created": 0, "total": 0, "last_when": when}
+                progress_message = None
                 try:
                     interval_minutes = self.interval_repeat_minutes(payload["repeat_mode"])
                     if interval_minutes is not None:
-                        task_ids = await self.create_interval_schedule_batch(
+                        if update.effective_message:
+                            progress_message = await update.effective_message.reply_text("正在读取当前已设定时，并准备批量创建…")
+
+                        async def report_progress(created: int, total: int, current_when: datetime) -> None:
+                            progress_state["created"] = created
+                            progress_state["total"] = total
+                            progress_state["last_when"] = current_when
+                            if not progress_message:
+                                return
+                            if created not in {1, total} and created % 5 != 0:
+                                return
+                            await self.edit_message(
+                                progress_message,
+                                (
+                                    f"批量定时创建中：{created}/{total}\n"
+                                    f"间隔：每 {interval_minutes} 分钟\n"
+                                    f"当前排到：{format_dt(current_when.isoformat(), self.config.default_timezone)}"
+                                ),
+                            )
+
+                        task_ids, total = await self.create_interval_schedule_batch(
                             session_row=session_row,
                             group_row=group_row,
                             message_text=payload["message_text"],
                             first_when=when,
                             interval_minutes=interval_minutes,
+                            progress_callback=report_progress,
                         )
                         self.db.clear_user_state(user_id)
                         last_when = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
-                        await self.render(
-                            update,
-                            (
-                                f"批量定时创建成功，共 {len(task_ids)} 条。\n"
-                                f"间隔：每 {interval_minutes} 分钟\n"
-                                f"开始：{format_dt(when.isoformat(), self.config.default_timezone)}\n"
-                                f"最后一条：{format_dt(last_when.isoformat(), self.config.default_timezone)}"
-                            ),
-                            self.tasks_keyboard(),
+                        final_text = (
+                            f"批量定时创建成功，共 {len(task_ids)} / {total} 条。\n"
+                            f"间隔：每 {interval_minutes} 分钟\n"
+                            f"开始：{format_dt(when.isoformat(), self.config.default_timezone)}\n"
+                            f"最后一条：{format_dt(last_when.isoformat(), self.config.default_timezone)}"
                         )
+                        if not await self.edit_message(progress_message, final_text, self.tasks_keyboard()):
+                            await self.render(update, final_text, self.tasks_keyboard())
                         return
 
                     message_id = await self.telethon.schedule_message(session_row, group_row, payload["message_text"], when)
@@ -341,7 +376,12 @@ class DsqfBotApp:
                 except Exception as exc:
                     message = self.telethon.describe_error(exc)
                     self.db.update_group(group_row["id"], speak_status=message, last_error=message)
-                    await self.render(update, f"创建失败：{message}")
+                    if interval_minutes is not None:
+                        failed_text = f"批量创建失败：已创建 {progress_state['created']} / {progress_state['total'] or '?'} 条。\n错误：{message}"
+                        if not await self.edit_message(progress_message, failed_text):
+                            await self.render(update, failed_text)
+                    else:
+                        await self.render(update, f"创建失败：{message}")
                 return
         except Exception as exc:
             LOGGER.exception("text handler failed")
@@ -712,7 +752,8 @@ class DsqfBotApp:
         message_text: str,
         first_when: datetime,
         interval_minutes: int,
-    ) -> list[int]:
+        progress_callback: Callable[[int, int, datetime], Awaitable[None]] | None = None,
+    ) -> tuple[list[int], int]:
         existing = await self.telethon.list_scheduled_messages(session_row, group_row)
         remaining = max(TELEGRAM_SCHEDULE_LIMIT - len(existing), 0)
         if remaining <= 0:
@@ -734,7 +775,9 @@ class DsqfBotApp:
                 status="scheduled",
             )
             created_task_ids.append(task_id)
-        return created_task_ids
+            if progress_callback:
+                await progress_callback(len(created_task_ids), remaining, when)
+        return created_task_ids, remaining
 
     def join_setup_keyboard(self, payload: dict[str, Any]) -> InlineKeyboardMarkup:
         selected = set(payload.get("session_ids", []))
