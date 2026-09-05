@@ -15,6 +15,11 @@ class AppConfig:
     api_hash: str
     database_path: Path
     session_dir: Path
+    client_device_model: str
+    client_system_version: str
+    client_app_version: str
+    client_lang_code: str
+    client_system_lang_code: str
     default_join_interval_seconds: int
     repeat_lookahead_minutes: int
     default_timezone: str
@@ -46,6 +51,11 @@ def load_config(base_dir: Path) -> AppConfig:
         api_hash=api_hash,
         database_path=database_path,
         session_dir=session_dir,
+        client_device_model=os.getenv("CLIENT_DEVICE_MODEL", "DSQFBot").strip() or "DSQFBot",
+        client_system_version=os.getenv("CLIENT_SYSTEM_VERSION", "Linux").strip() or "Linux",
+        client_app_version=os.getenv("CLIENT_APP_VERSION", "1.0").strip() or "1.0",
+        client_lang_code=os.getenv("CLIENT_LANG_CODE", "zh-hans").strip() or "zh-hans",
+        client_system_lang_code=os.getenv("CLIENT_SYSTEM_LANG_CODE", "zh-hans").strip() or "zh-hans",
         default_join_interval_seconds=max(int(os.getenv("DEFAULT_JOIN_INTERVAL_SECONDS", "60") or "60"), 5),
         repeat_lookahead_minutes=max(int(os.getenv("REPEAT_LOOKAHEAD_MINUTES", "5") or "5"), 1),
         default_timezone=os.getenv("DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai",

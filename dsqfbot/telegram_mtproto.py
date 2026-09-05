@@ -42,7 +42,16 @@ class TelethonManager:
         return str((self.config.session_dir / session_file).resolve())
 
     def build_client(self, session_file: str) -> TelegramClient:
-        return TelegramClient(self.session_path(session_file), self.config.api_id, self.config.api_hash)
+        return TelegramClient(
+            self.session_path(session_file),
+            self.config.api_id,
+            self.config.api_hash,
+            device_model=self.config.client_device_model,
+            system_version=self.config.client_system_version,
+            app_version=self.config.client_app_version,
+            lang_code=self.config.client_lang_code,
+            system_lang_code=self.config.client_system_lang_code,
+        )
 
     def delete_session_files(self, session_file: str) -> None:
         base_path = Path(self.session_path(session_file))

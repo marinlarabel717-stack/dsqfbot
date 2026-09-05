@@ -61,6 +61,11 @@ API_ID=
 API_HASH=
 DATABASE_PATH=storage/dsqfbot.sqlite3
 SESSION_DIR=storage/sessions
+CLIENT_DEVICE_MODEL=DSQFBot
+CLIENT_SYSTEM_VERSION=Linux
+CLIENT_APP_VERSION=1.0
+CLIENT_LANG_CODE=zh-hans
+CLIENT_SYSTEM_LANG_CODE=zh-hans
 DEFAULT_JOIN_INTERVAL_SECONDS=60
 REPEAT_LOOKAHEAD_MINUTES=5
 DEFAULT_TIMEZONE=Asia/Shanghai
@@ -73,6 +78,7 @@ Notes:
 - `API_ID` and `API_HASH`: Telegram app credentials for Telethon
 - `DATABASE_PATH`: SQLite database path
 - `SESSION_DIR`: folder for user session files
+- `CLIENT_*`: explicit client fingerprint sent during login instead of relying on Telethon defaults
 
 ## Run
 
