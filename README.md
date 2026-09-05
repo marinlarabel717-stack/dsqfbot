@@ -6,6 +6,7 @@
 
 - Button-only bot UI, no slash-command workflow required
 - Add and verify multiple Telegram user sessions through the bot
+- Import one or more existing `.session` files from a zip archive
 - Sync group/channel lists for each session
 - Batch import `t.me` links and enqueue join jobs
 - Smart join intervals to reduce aggressive join bursts
@@ -90,7 +91,7 @@ python main.py
 
 1. Send any message to the bot
 2. Open `账号管理`
-3. Add one or more user accounts
+3. Add one or more user accounts, or upload a zip containing `.session` files
 4. Open `批量加群`
 5. Select sessions and distribution mode
 6. Paste group links

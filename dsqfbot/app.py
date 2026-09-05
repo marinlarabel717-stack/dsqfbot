@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zipfile import BadZipFile, ZipFile
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -128,6 +131,72 @@ class DsqfBotApp:
                 self.account_detail_keyboard(session_id),
             )
 
+    def ensure_unique_label(self, label: str, used_labels: set[str] | None = None) -> str:
+        existing = used_labels if used_labels is not None else {item["label"] for item in self.db.list_sessions()}
+        base = (label or "session").strip() or "session"
+        candidate = base
+        index = 2
+        while candidate in existing:
+            candidate = f"{base}-{index}"
+            index += 1
+        existing.add(candidate)
+        return candidate
+
+    def ensure_unique_session_file(self, session_name: str, used_files: set[str] | None = None) -> str:
+        existing = used_files if used_files is not None else {item["session_file"] for item in self.db.list_sessions()}
+        base = (session_name or "session").strip() or "session"
+        candidate = base
+        index = 2
+        while candidate in existing:
+            candidate = f"{base}-{index}"
+            index += 1
+        existing.add(candidate)
+        return candidate
+
+    async def import_session_archive(self, archive_path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+        imported: list[dict[str, Any]] = []
+        failed: list[str] = []
+        used_files = {item["session_file"] for item in self.db.list_sessions()}
+        used_labels = {item["label"] for item in self.db.list_sessions()}
+
+        with tempfile.TemporaryDirectory(prefix="dsqfbot-import-") as temp_dir:
+            extract_dir = Path(temp_dir) / "unzipped"
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            with ZipFile(archive_path) as archive:
+                archive.extractall(extract_dir)
+
+            session_paths = sorted(path for path in extract_dir.rglob("*.session") if path.is_file())
+            if not session_paths:
+                raise RuntimeError("压缩包里没有找到 .session 文件")
+
+            for source_path in session_paths:
+                session_file = self.ensure_unique_session_file(source_path.stem, used_files)
+                target_path = self.telethon.session_sqlite_path(session_file)
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source_path, target_path)
+                try:
+                    info = await self.telethon.inspect_session(session_file)
+                    label = self.ensure_unique_label(info["label"], used_labels)
+                    session_id = self.db.create_session(
+                        label=label,
+                        phone=info["phone"],
+                        session_file=session_file,
+                        is_premium=info["is_premium"],
+                        status="online",
+                    )
+                    imported.append(
+                        {
+                            "id": session_id,
+                            "label": label,
+                            "phone": info["phone"],
+                            "is_premium": info["is_premium"],
+                        }
+                    )
+                except Exception as exc:
+                    self.telethon.delete_session_files(session_file)
+                    failed.append(f"{source_path.name}: {self.telethon.describe_error(exc)}")
+        return imported, failed
+
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.ensure_admin(update):
             return
@@ -182,45 +251,8 @@ class DsqfBotApp:
                 self.db.set_user_state(user_id, "wait_session_code", payload)
                 await self.render(update, "验证码已经发到 Telegram。把验证码直接发给我。", self.state_cancel_keyboard())
                 return
-            if state == "wait_session_code":
-                result = await self.telethon.finish_login(
-                    session_file=payload["session_file"],
-                    phone=payload["phone"],
-                    code=text,
-                    phone_code_hash=payload["phone_code_hash"],
-                )
-                if result.need_password:
-                    payload["code"] = text
-                    self.db.set_user_state(user_id, "wait_session_password", payload)
-                    await self.render(update, "这个号开了二步验证。把二步密码发给我。", self.state_cancel_keyboard())
-                    return
-                session_id = self.db.create_session(
-                    label=payload["label"],
-                    phone=payload["phone"],
-                    session_file=payload["session_file"],
-                    is_premium=result.is_premium,
-                    status="online",
-                )
-                self.db.clear_user_state(user_id)
-                await self.render(update, f"账号添加成功：{payload['label']}，Premium：{'是' if result.is_premium else '否'}", self.account_detail_keyboard(session_id))
-                return
-            if state == "wait_session_password":
-                result = await self.telethon.finish_login(
-                    session_file=payload["session_file"],
-                    phone=payload["phone"],
-                    code=payload.get("code", "00000"),
-                    phone_code_hash=payload["phone_code_hash"],
-                    password=text,
-                )
-                session_id = self.db.create_session(
-                    label=payload["label"],
-                    phone=payload["phone"],
-                    session_file=payload["session_file"],
-                    is_premium=result.is_premium,
-                    status="online",
-                )
-                self.db.clear_user_state(user_id)
-                await self.render(update, f"账号添加成功：{payload['label']}，Premium：{'是' if result.is_premium else '否'}", self.account_detail_keyboard(session_id))
+            if state == "wait_session_zip":
+                await self.render(update, "这里等的是 zip 压缩包文件，不是文字。直接把 session 的 zip 发给我。", self.state_cancel_keyboard())
                 return
             if state == "wait_join_links":
                 links = parse_links(text)
@@ -282,6 +314,46 @@ class DsqfBotApp:
             return
         await self.send_home(update)
 
+    async def on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.ensure_admin(update):
+            return
+        user_id = update.effective_user.id
+        state, payload = self.db.get_user_state(user_id)
+        document = update.effective_message.document if update.effective_message else None
+        if not document:
+            await self.render(update, "没有收到文件。")
+            return
+        if state != "wait_session_zip":
+            await self.render(update, "当前没有等待导入的 session 压缩包。先去账号管理里点“上传Session压缩包”。", self.accounts_keyboard())
+            return
+
+        file_name = document.file_name or "session.zip"
+        if not file_name.lower().endswith(".zip"):
+            await self.render(update, "只支持上传 .zip 压缩包。", self.state_cancel_keyboard())
+            return
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="dsqfbot-upload-") as temp_dir:
+                archive_path = Path(temp_dir) / file_name
+                telegram_file = await context.bot.get_file(document.file_id)
+                await telegram_file.download_to_drive(custom_path=str(archive_path))
+                imported, failed = await self.import_session_archive(archive_path)
+        except BadZipFile:
+            await self.render(update, "这个 zip 压缩包打不开，换一个重新发。", self.state_cancel_keyboard())
+            return
+        except Exception as exc:
+            LOGGER.exception("document handler failed")
+            await self.render(update, f"导入失败：{exc}", self.state_cancel_keyboard())
+            return
+
+        self.db.clear_user_state(user_id)
+        lines = [f"导入完成：成功 {len(imported)} 个，失败 {len(failed)} 个"]
+        for item in imported[:10]:
+            lines.append(f"成功：{item['label']} | {item['phone']} | {'Premium' if item['is_premium'] else '普通'}")
+        for item in failed[:10]:
+            lines.append(f"失败：{item}")
+        await self.render(update, "\n".join(lines), self.accounts_keyboard())
+
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.ensure_admin(update):
             return
@@ -304,6 +376,10 @@ class DsqfBotApp:
             if data == "account:add":
                 self.db.set_user_state(user_id, "wait_session_label", {})
                 await self.render(update, "先发这个账号的备注名字。", self.state_cancel_keyboard())
+                return
+            if data == "account:import_zip":
+                self.db.set_user_state(user_id, "wait_session_zip", {})
+                await self.render(update, "把 session 文件打成 zip 压缩包后直接发给我。支持一个 zip 里放多个 .session 文件。", self.state_cancel_keyboard())
                 return
             if data.startswith("account:view:"):
                 session_id = int(data.split(":")[-1])
@@ -484,6 +560,7 @@ class DsqfBotApp:
         for item in self.db.list_sessions():
             rows.append([InlineKeyboardButton(f"{item['label']} ({'Premium' if item['is_premium'] else '普通'})", callback_data=f"account:view:{item['id']}")])
         rows.append([InlineKeyboardButton("添加账号", callback_data="account:add")])
+        rows.append([InlineKeyboardButton("上传Session压缩包", callback_data="account:import_zip")])
         rows.append([InlineKeyboardButton("返回首页", callback_data="home")])
         return InlineKeyboardMarkup(rows)
 
@@ -820,6 +897,7 @@ def build_application(config: AppConfig, db: Database, telethon: TelethonManager
     )
     application.add_handler(CommandHandler("start", runtime.on_start))
     application.add_handler(CallbackQueryHandler(runtime.on_callback))
+    application.add_handler(MessageHandler(filters.Document.ALL, runtime.on_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, runtime.on_text))
     return application
 

@@ -41,6 +41,9 @@ class TelethonManager:
     def session_path(self, session_file: str) -> str:
         return str((self.config.session_dir / session_file).resolve())
 
+    def session_sqlite_path(self, session_file: str) -> Path:
+        return Path(self.session_path(session_file)).with_suffix(".session")
+
     def build_client(self, session_file: str) -> TelegramClient:
         return TelegramClient(
             self.session_path(session_file),
@@ -55,13 +58,30 @@ class TelethonManager:
 
     def delete_session_files(self, session_file: str) -> None:
         base_path = Path(self.session_path(session_file))
-        candidates = [base_path, base_path.with_suffix(".session"), base_path.with_suffix(".session-journal")]
+        candidates = [base_path, self.session_sqlite_path(session_file), self.session_sqlite_path(session_file).with_suffix(".session-journal")]
         for item in candidates:
             try:
                 if item.exists():
                     item.unlink()
             except OSError:
                 continue
+
+    async def inspect_session(self, session_file: str) -> dict[str, Any]:
+        client = self.build_client(session_file)
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                raise RuntimeError("账号掉线")
+            me = await client.get_me()
+            label = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip()
+            phone = getattr(me, "phone", None)
+            return {
+                "label": label or session_file,
+                "phone": f"+{phone}" if phone else "-",
+                "is_premium": bool(getattr(me, "premium", False)),
+            }
+        finally:
+            await client.disconnect()
 
     async def begin_login(self, label: str, phone: str) -> tuple[str, str]:
         session_file = f"{slugify(label)}-{int(datetime.utcnow().timestamp())}"
