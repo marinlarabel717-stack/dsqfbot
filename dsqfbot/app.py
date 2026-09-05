@@ -86,6 +86,48 @@ class DsqfBotApp:
         )
         await self.render(update, text, self.home_keyboard())
 
+    async def finalize_session_login(self, update: Update, user_id: int, payload: dict[str, Any], result: Any) -> None:
+        session_id = self.db.create_session(
+            label=payload["label"],
+            phone=payload["phone"],
+            session_file=payload["session_file"],
+            is_premium=result.is_premium,
+            status="pending",
+        )
+        self.db.clear_user_state(user_id)
+        session_row = self.db.get_session(session_id)
+        if not session_row:
+            await self.render(update, "账号已登录，但本地保存失败。")
+            return
+        try:
+            info = await self.telethon.verify_session(session_row)
+            self.db.update_session(
+                session_id,
+                status="online",
+                is_premium=int(info["is_premium"]),
+                label=payload["label"],
+                last_error="",
+            )
+            await self.render(
+                update,
+                f"账号添加成功：{payload['label']}，Premium：{'是' if info['is_premium'] else '否'}",
+                self.account_detail_keyboard(session_id),
+            )
+        except Exception as exc:
+            message = self.telethon.describe_error(exc)
+            self.db.update_session(
+                session_id,
+                status="offline",
+                is_premium=int(result.is_premium),
+                last_error=f"登录成功，但会话校验失败：{message}",
+            )
+            await self.render(
+                update,
+                "验证码已通过，但当前会话没有通过 Telegram 二次校验，账号先记为掉线。\n"
+                "这通常是刚登录就被撤销，或当前号码/环境被风控了。",
+                self.account_detail_keyboard(session_id),
+            )
+
     async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.ensure_admin(update):
             return
@@ -103,6 +145,30 @@ class DsqfBotApp:
             await self.send_home(update)
             return
         try:
+            if state == "wait_session_code":
+                result = await self.telethon.finish_login(
+                    session_file=payload["session_file"],
+                    phone=payload["phone"],
+                    code=text,
+                    phone_code_hash=payload["phone_code_hash"],
+                )
+                if result.need_password:
+                    payload["code"] = text
+                    self.db.set_user_state(user_id, "wait_session_password", payload)
+                    await self.render(update, "这个号开了二步验证。把二步密码发给我。", self.state_cancel_keyboard())
+                    return
+                await self.finalize_session_login(update, user_id, payload, result)
+                return
+            if state == "wait_session_password":
+                result = await self.telethon.finish_login(
+                    session_file=payload["session_file"],
+                    phone=payload["phone"],
+                    code=payload.get("code", "00000"),
+                    phone_code_hash=payload["phone_code_hash"],
+                    password=text,
+                )
+                await self.finalize_session_login(update, user_id, payload, result)
+                return
             if state == "wait_session_label":
                 payload["label"] = text
                 self.db.set_user_state(user_id, "wait_session_phone", payload)
