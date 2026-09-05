@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+storage/*.sqlite3
+storage/sessions/*.session*
+storage/sessions/*.json
+storage/runtime.log
