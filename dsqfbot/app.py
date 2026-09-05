@@ -8,7 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from .config import AppConfig, load_config
 from .db import Database
@@ -85,6 +85,13 @@ class DsqfBotApp:
             f"定时任务：{len(self.db.list_tasks(100))}"
         )
         await self.render(update, text, self.home_keyboard())
+
+    async def on_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.ensure_admin(update):
+            return
+        if update.effective_user:
+            self.db.clear_user_state(update.effective_user.id)
+        await self.send_home(update)
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self.ensure_admin(update):
@@ -734,6 +741,7 @@ def build_application(config: AppConfig, db: Database, telethon: TelethonManager
         .post_shutdown(runtime.on_shutdown)
         .build()
     )
+    application.add_handler(CommandHandler("start", runtime.on_start))
     application.add_handler(CallbackQueryHandler(runtime.on_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, runtime.on_text))
     return application
