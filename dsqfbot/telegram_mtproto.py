@@ -248,7 +248,9 @@ class TelethonManager:
                 return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
             if getattr(permissions, "has_left", False):
                 return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
-            return {"join_status": group_row.get("join_status", "joined"), "speak_status": group_row.get("speak_status", "unknown"), "last_error": ""}
+            if getattr(permissions, "send_messages", None) is False:
+                return {"join_status": "joined", "speak_status": "无发言权限", "last_error": "无发言权限"}
+            return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
         finally:
             await client.disconnect()
 
@@ -284,5 +286,15 @@ class TelethonManager:
             return mapping[name]
         message = str(exc).strip() or name
         if "A wait of" in message:
-            return message
+            return f"风控等待 {TelethonManager.extract_wait_seconds(exc)} 秒"
         return message
+
+    @staticmethod
+    def extract_wait_seconds(exc: Exception) -> int:
+        seconds = int(getattr(exc, "seconds", 0) or 0)
+        if seconds > 0:
+            return seconds
+        match = re.search(r"A wait of (\d+) seconds", str(exc))
+        if match:
+            return int(match.group(1))
+        return 60

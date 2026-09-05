@@ -53,6 +53,9 @@ class DsqfBotApp:
         elif update.effective_message:
             await update.effective_message.reply_text(text, reply_markup=keyboard)
 
+    def state_cancel_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("取消当前流程", callback_data="state:cancel")]])
+
     def home_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
@@ -64,7 +67,10 @@ class DsqfBotApp:
                     InlineKeyboardButton("定时任务", callback_data="tasks"),
                     InlineKeyboardButton("加群队列", callback_data="join:list"),
                 ],
-                [InlineKeyboardButton("刷新首页", callback_data="home")],
+                [
+                    InlineKeyboardButton("刷新首页", callback_data="home"),
+                    InlineKeyboardButton("取消当前流程", callback_data="state:cancel"),
+                ],
             ]
         )
 
@@ -93,7 +99,7 @@ class DsqfBotApp:
             if state == "wait_session_label":
                 payload["label"] = text
                 self.db.set_user_state(user_id, "wait_session_phone", payload)
-                await self.render(update, "发这个账号的手机号，格式例子：+8613812345678")
+                await self.render(update, "发这个账号的手机号，格式例子：+8613812345678", self.state_cancel_keyboard())
                 return
             if state == "wait_session_phone":
                 payload["phone"] = text
@@ -101,7 +107,7 @@ class DsqfBotApp:
                 payload["session_file"] = session_file
                 payload["phone_code_hash"] = phone_code_hash
                 self.db.set_user_state(user_id, "wait_session_code", payload)
-                await self.render(update, "验证码已经发到 Telegram。把验证码直接发给我。")
+                await self.render(update, "验证码已经发到 Telegram。把验证码直接发给我。", self.state_cancel_keyboard())
                 return
             if state == "wait_session_code":
                 result = await self.telethon.finish_login(
@@ -113,7 +119,7 @@ class DsqfBotApp:
                 if result.need_password:
                     payload["code"] = text
                     self.db.set_user_state(user_id, "wait_session_password", payload)
-                    await self.render(update, "这个号开了二步验证。把二步密码发给我。")
+                    await self.render(update, "这个号开了二步验证。把二步密码发给我。", self.state_cancel_keyboard())
                     return
                 session_id = self.db.create_session(
                     label=payload["label"],
@@ -215,12 +221,16 @@ class DsqfBotApp:
             if data == "home":
                 await self.send_home(update)
                 return
+            if data == "state:cancel":
+                self.db.clear_user_state(user_id)
+                await self.render(update, "当前流程已取消。", self.home_keyboard())
+                return
             if data == "accounts":
                 await self.render(update, self.accounts_text(), self.accounts_keyboard())
                 return
             if data == "account:add":
                 self.db.set_user_state(user_id, "wait_session_label", {})
-                await self.render(update, "先发这个账号的备注名字。")
+                await self.render(update, "先发这个账号的备注名字。", self.state_cancel_keyboard())
                 return
             if data.startswith("account:view:"):
                 session_id = int(data.split(":")[-1])
@@ -232,9 +242,13 @@ class DsqfBotApp:
                 if not session_row:
                     await self.render(update, "账号不存在。")
                     return
-                info = await self.telethon.verify_session(session_row)
-                self.db.update_session(session_id, status="online", is_premium=int(info["is_premium"]), label=info["label"], last_error="")
-                await self.render(update, "账号状态已刷新。", self.account_detail_keyboard(session_id))
+                try:
+                    info = await self.telethon.verify_session(session_row)
+                    self.db.update_session(session_id, status="online", is_premium=int(info["is_premium"]), label=info["label"], last_error="")
+                    await self.render(update, "账号状态已刷新。", self.account_detail_keyboard(session_id))
+                except Exception as exc:
+                    self.db.update_session(session_id, status="offline", last_error=self.telethon.describe_error(exc))
+                    await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
                 return
             if data.startswith("account:sync:"):
                 session_id = int(data.split(":")[-1])
@@ -242,10 +256,15 @@ class DsqfBotApp:
                 if not session_row:
                     await self.render(update, "账号不存在。")
                     return
-                items = await self.telethon.list_groups(session_row)
-                for item in items:
-                    self.db.upsert_group(session_id, item["peer_id"], item["title"], item["username"], item["link"])
-                await self.render(update, f"同步完成，共 {len(items)} 个群/频道。", self.account_detail_keyboard(session_id))
+                try:
+                    items = await self.telethon.list_groups(session_row)
+                    for item in items:
+                        self.db.upsert_group(session_id, item["peer_id"], item["title"], item["username"], item["link"])
+                    self.db.update_session(session_id, status="online", last_error="")
+                    await self.render(update, f"同步完成，共 {len(items)} 个群/频道。", self.account_detail_keyboard(session_id))
+                except Exception as exc:
+                    self.db.update_session(session_id, status="offline", last_error=self.telethon.describe_error(exc))
+                    await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
                 return
             if data.startswith("account:groups:"):
                 session_id = int(data.split(":")[-1])
@@ -254,6 +273,22 @@ class DsqfBotApp:
             if data.startswith("group:view:"):
                 group_id = int(data.split(":")[-1])
                 await self.render(update, self.group_detail_text(group_id), self.group_detail_keyboard(group_id))
+                return
+            if data.startswith("group:scheduled:"):
+                group_id = int(data.split(":")[-1])
+                group_row = self.db.get_group(group_id)
+                if not group_row:
+                    await self.render(update, "群不存在。")
+                    return
+                session_row = self.db.get_session(group_row["session_id"])
+                if not session_row:
+                    await self.render(update, "账号不存在。")
+                    return
+                try:
+                    messages = await self.telethon.list_scheduled_messages(session_row, group_row)
+                    await self.render(update, self.scheduled_messages_text(group_row, messages), self.scheduled_messages_keyboard(group_id))
+                except Exception as exc:
+                    await self.render(update, f"读取失败：{self.telethon.describe_error(exc)}", self.group_detail_keyboard(group_id))
                 return
             if data.startswith("group:refresh:"):
                 group_id = int(data.split(":")[-1])
@@ -276,7 +311,7 @@ class DsqfBotApp:
                     await self.render(update, "群不存在。")
                     return
                 self.db.set_user_state(user_id, "wait_schedule_message", {"group_id": group_id, "session_id": group_row["session_id"]})
-                await self.render(update, "把要发送的消息内容直接发给我。")
+                await self.render(update, "把要发送的消息内容直接发给我。", self.state_cancel_keyboard())
                 return
             if data.startswith("schedule:repeat:"):
                 if state != "wait_schedule_repeat":
@@ -285,7 +320,7 @@ class DsqfBotApp:
                 repeat_mode = data.split(":")[-1]
                 payload["repeat_mode"] = repeat_mode
                 self.db.set_user_state(user_id, "wait_schedule_time", payload)
-                await self.render(update, f"把发送时间发给我，格式：2026-09-06 10:30\n当前重复：{'每天重复' if repeat_mode == 'daily' else '单次'}")
+                await self.render(update, f"把发送时间发给我，格式：2026-09-06 10:30\n当前重复：{'每天重复' if repeat_mode == 'daily' else '单次'}", self.state_cancel_keyboard())
                 return
             if data == "join:setup":
                 payload = {"session_ids": [], "distribution": "balanced"}
@@ -317,7 +352,7 @@ class DsqfBotApp:
                     await self.render(update, "先选至少一个账号。", self.join_setup_keyboard(payload or {"session_ids": [], "distribution": "balanced"}))
                     return
                 self.db.set_user_state(user_id, "wait_join_links", payload)
-                await self.render(update, "把群链接批量发给我，一行一个也行。")
+                await self.render(update, "把群链接批量发给我，一行一个也行。", self.state_cancel_keyboard())
                 return
             if data.startswith("join:interval:"):
                 if state != "wait_join_interval":
@@ -329,9 +364,12 @@ class DsqfBotApp:
                 await self.render(update, summary, self.home_keyboard())
                 return
             if data == "join:list":
-                await self.render(update, self.join_jobs_text(), self.home_keyboard())
+                await self.render(update, self.join_jobs_text(), self.join_jobs_keyboard())
                 return
             if data == "tasks":
+                await self.render(update, self.tasks_text(), self.tasks_keyboard())
+                return
+            if data == "tasks:refresh":
                 await self.render(update, self.tasks_text(), self.tasks_keyboard())
                 return
             if data.startswith("task:view:"):
@@ -341,7 +379,7 @@ class DsqfBotApp:
             if data.startswith("task:delete:"):
                 task_id = int(data.split(":")[-1])
                 await self.delete_task(task_id)
-                await self.render(update, "任务已停用。", self.home_keyboard())
+                await self.render(update, "任务已停用。", self.tasks_keyboard())
                 return
         except Exception as exc:
             LOGGER.exception("callback failed")
@@ -355,7 +393,7 @@ class DsqfBotApp:
             return "还没有账号，先点“添加账号”。"
         lines = ["账号列表"]
         for item in sessions:
-            lines.append(f"{item['id']}. {item['label']} | {item['phone']} | {'Premium' if item['is_premium'] else '普通'} | {item['status']}")
+            lines.append(f"{item['id']}. {item['label']} | {item['phone']} | {'Premium' if item['is_premium'] else '普通'} | {self.human_session_status(item['status'])}")
         return "\n".join(lines)
 
     def accounts_keyboard(self) -> InlineKeyboardMarkup:
@@ -374,7 +412,7 @@ class DsqfBotApp:
             f"账号：{row['label']}\n"
             f"手机号：{row['phone']}\n"
             f"Premium：{'是' if row['is_premium'] else '否'}\n"
-            f"状态：{row['status']}\n"
+            f"状态：{self.human_session_status(row['status'])}\n"
             f"错误：{row['last_error'] or '-'}"
         )
 
@@ -396,7 +434,7 @@ class DsqfBotApp:
             return "这个账号还没有同步到群，先点“同步群组”。"
         lines = ["群组列表（最近 20 个）"]
         for item in groups[:20]:
-            lines.append(f"{item['id']}. {item['title']} | {item['join_status']} | {item['speak_status']}")
+            lines.append(f"{item['id']}. {item['title']} | {self.human_join_status(item['join_status'])} | {item['speak_status']}")
         return "\n".join(lines)
 
     def groups_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
@@ -412,7 +450,7 @@ class DsqfBotApp:
         return (
             f"群名：{group['title']}\n"
             f"用户名：{group['username'] or '-'}\n"
-            f"加入状态：{group['join_status']}\n"
+            f"加入状态：{self.human_join_status(group['join_status'])}\n"
             f"发言状态：{group['speak_status']}\n"
             f"错误：{group['last_error'] or '-'}"
         )
@@ -426,6 +464,7 @@ class DsqfBotApp:
                     InlineKeyboardButton("刷新状态", callback_data=f"group:refresh:{group_id}"),
                     InlineKeyboardButton("新建定时消息", callback_data=f"group:schedule:{group_id}"),
                 ],
+                [InlineKeyboardButton("查看已设定时", callback_data=f"group:scheduled:{group_id}")],
                 [InlineKeyboardButton("返回群列表", callback_data=f"account:groups:{session_id}")],
             ]
         )
@@ -471,6 +510,10 @@ class DsqfBotApp:
                     InlineKeyboardButton("60 秒", callback_data="join:interval:60"),
                     InlineKeyboardButton("120 秒", callback_data="join:interval:120"),
                 ],
+                [
+                    InlineKeyboardButton("180 秒", callback_data="join:interval:180"),
+                    InlineKeyboardButton("300 秒", callback_data="join:interval:300"),
+                ],
                 [InlineKeyboardButton("返回首页", callback_data="home")],
             ]
         )
@@ -503,8 +546,16 @@ class DsqfBotApp:
         for item in jobs:
             session_row = self.db.get_session(item["session_id"])
             label = session_row["label"] if session_row else str(item["session_id"])
-            lines.append(f"{item['id']}. {label} | {item['status']} | {item['link']}")
+            lines.append(f"{item['id']}. {label} | {self.human_join_job_status(item['status'])} | {item['link']}")
         return "\n".join(lines)
+
+    def join_jobs_keyboard(self) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("刷新队列", callback_data="join:list")],
+                [InlineKeyboardButton("返回首页", callback_data="home")],
+            ]
+        )
 
     def tasks_text(self) -> str:
         tasks = self.db.list_tasks()
@@ -513,12 +564,13 @@ class DsqfBotApp:
         lines = ["定时任务列表"]
         for item in tasks:
             repeat_text = "每天" if item["repeat_mode"] == "daily" else "单次"
-            lines.append(f"{item['id']}. {item['group_title']} | {format_dt(item['schedule_at'], self.config.default_timezone)} | {repeat_text} | {item['status']}")
+            lines.append(f"{item['id']}. {item['group_title']} | {format_dt(item['schedule_at'], self.config.default_timezone)} | {repeat_text} | {self.human_task_status(item['status'])}")
         return "\n".join(lines)
 
     def tasks_keyboard(self) -> InlineKeyboardMarkup:
         tasks = self.db.list_tasks()
         rows = [[InlineKeyboardButton(f"{item['id']}. {item['group_title'][:30]}", callback_data=f"task:view:{item['id']}")] for item in tasks[:20]]
+        rows.append([InlineKeyboardButton("刷新任务", callback_data="tasks:refresh")])
         rows.append([InlineKeyboardButton("返回首页", callback_data="home")])
         return InlineKeyboardMarkup(rows)
 
@@ -532,9 +584,64 @@ class DsqfBotApp:
             f"群：{item['group_title']}\n"
             f"时间：{format_dt(item['schedule_at'], self.config.default_timezone)}\n"
             f"重复：{'每天' if item['repeat_mode'] == 'daily' else '单次'}\n"
-            f"状态：{item['status']}\n"
+            f"状态：{self.human_task_status(item['status'])}\n"
             f"错误：{item['last_error'] or '-'}"
         )
+
+    def scheduled_messages_text(self, group_row: dict[str, Any], messages: list[dict[str, Any]]) -> str:
+        if not messages:
+            return f"{group_row['title']}\n\n当前 Telegram 里还没有已设定时消息。"
+        lines = [f"{group_row['title']} 的已设定时消息"]
+        for item in messages[:10]:
+            preview = (item["text"] or "").replace("\n", " ")
+            if len(preview) > 24:
+                preview = preview[:24] + "..."
+            lines.append(f"{item['message_id']}. {format_dt(item['schedule_at'], self.config.default_timezone)} | {preview or '[空消息]'}")
+        return "\n".join(lines)
+
+    def scheduled_messages_keyboard(self, group_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("刷新已设定时", callback_data=f"group:scheduled:{group_id}")],
+                [InlineKeyboardButton("返回群详情", callback_data=f"group:view:{group_id}")],
+            ]
+        )
+
+    @staticmethod
+    def human_session_status(status: str) -> str:
+        return {
+            "online": "在线",
+            "offline": "掉线",
+            "pending": "待登录",
+        }.get(status, status)
+
+    @staticmethod
+    def human_join_status(status: str) -> str:
+        return {
+            "joined": "已加入",
+            "awaiting_approval": "等待审批",
+            "not_joined": "未加入",
+            "left": "已离开",
+        }.get(status, status)
+
+    @staticmethod
+    def human_join_job_status(status: str) -> str:
+        return {
+            "pending": "排队中",
+            "retry": "等待重试",
+            "running": "执行中",
+            "joined": "已加入",
+            "awaiting_approval": "等待审批",
+            "failed": "失败",
+        }.get(status, status)
+
+    @staticmethod
+    def human_task_status(status: str) -> str:
+        return {
+            "scheduled": "已设定",
+            "cancelled": "已停用",
+            "failed": "失败",
+        }.get(status, status)
 
     def task_detail_keyboard(self, task_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -555,7 +662,7 @@ class DsqfBotApp:
                 await self.telethon.delete_scheduled_message(session_row, group_row, int(task["last_telegram_message_id"]))
             except Exception as exc:
                 LOGGER.warning("delete scheduled message failed: %s", exc)
-        self.db.update_task(task_id, status="cancelled")
+        self.db.update_task(task_id, status="cancelled", next_run_at=None)
 
     async def join_worker(self) -> None:
         while True:
@@ -582,7 +689,12 @@ class DsqfBotApp:
                 self.db.finish_join_job(job["id"], result.get("join_status", "joined"), group_id=group_id)
             except Exception as exc:
                 message = self.telethon.describe_error(exc)
-                self.db.finish_join_job(job["id"], "failed", last_error=message)
+                if "风控等待" in message:
+                    retry_at = (datetime.utcnow() + timedelta(seconds=self.telethon.extract_wait_seconds(exc))).replace(microsecond=0).isoformat()
+                    self.db.retry_join_job(job["id"], retry_at, message)
+                else:
+                    self.db.finish_join_job(job["id"], "failed", last_error=message)
+                    self.db.update_session(session_row["id"], status="offline" if message == "账号掉线" else session_row["status"], last_error=message)
             await asyncio.sleep(1)
 
     async def repeat_worker(self) -> None:
@@ -608,6 +720,8 @@ class DsqfBotApp:
                     message = self.telethon.describe_error(exc)
                     self.db.update_task(task["id"], last_error=message)
                     self.db.update_group(group_row["id"], speak_status=message, last_error=message)
+                    if message == "账号掉线":
+                        self.db.update_session(session_row["id"], status="offline", last_error=message)
             await asyncio.sleep(30)
 
 
