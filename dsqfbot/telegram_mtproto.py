@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import random
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from telethon import TelegramClient, functions, errors
+from telethon import TelegramClient, errors, functions
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
@@ -23,6 +24,7 @@ from .utils import normalize_link, slugify
 
 INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)", re.IGNORECASE)
 PUBLIC_RE = re.compile(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})/?$", re.IGNORECASE)
+PROBE_EMOJIS = ("😀", "😄", "😎", "🥳", "✨", "🔥", "🍀", "🌊", "🎯", "🚀")
 
 
 @dataclass(slots=True)
@@ -278,6 +280,8 @@ class TelethonManager:
         client = self.build_client(session_row["session_file"])
         await client.connect()
         try:
+            if not await client.is_user_authorized():
+                raise RuntimeError("账号掉线")
             try:
                 entity = await self._resolve_entity(client, group_row)
             except errors.UserNotParticipantError:
@@ -289,6 +293,19 @@ class TelethonManager:
                 return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
             if getattr(permissions, "send_messages", None) is False:
                 return {"join_status": "joined", "speak_status": "无发言权限", "last_error": "无发言权限"}
+            try:
+                probe_message = await client.send_message(entity, random.choice(PROBE_EMOJIS))
+            except Exception as exc:
+                message = self.describe_error(exc)
+                if message == "账号掉线":
+                    raise
+                if message == "未加入群":
+                    return {"join_status": "not_joined", "speak_status": message, "last_error": message}
+                return {"join_status": "joined", "speak_status": message, "last_error": message}
+            try:
+                await client.delete_messages(entity, [probe_message.id])
+            except Exception:
+                pass
             return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
         finally:
             await client.disconnect()

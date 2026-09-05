@@ -16,6 +16,7 @@
   - not joined
   - awaiting approval
   - no speaking permission
+  - real send-probe result using a temporary random emoji
 - Create scheduled Telegram messages
 - Daily repeat support for premium-capable accounts via rolling future scheduling
 - View queued join jobs
