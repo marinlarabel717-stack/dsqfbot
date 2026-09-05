@@ -163,6 +163,18 @@ class Database:
         with self.connect() as conn:
             conn.execute(f"UPDATE sessions SET {keys} WHERE id = ?", (*fields.values(), session_id))
 
+    def delete_session(self, session_id: int) -> None:
+        with self.connect() as conn:
+            group_ids = [int(row["id"]) for row in conn.execute("SELECT id FROM groups WHERE session_id = ?", (session_id,)).fetchall()]
+            if group_ids:
+                placeholders = ", ".join("?" for _ in group_ids)
+                conn.execute(f"DELETE FROM tasks WHERE group_id IN ({placeholders})", group_ids)
+                conn.execute(f"DELETE FROM join_jobs WHERE group_id IN ({placeholders})", group_ids)
+            conn.execute("DELETE FROM tasks WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM join_jobs WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM groups WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
     def upsert_group(
         self,
         session_id: int,

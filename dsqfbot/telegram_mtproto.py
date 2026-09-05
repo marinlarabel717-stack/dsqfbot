@@ -44,6 +44,16 @@ class TelethonManager:
     def build_client(self, session_file: str) -> TelegramClient:
         return TelegramClient(self.session_path(session_file), self.config.api_id, self.config.api_hash)
 
+    def delete_session_files(self, session_file: str) -> None:
+        base_path = Path(self.session_path(session_file))
+        candidates = [base_path, base_path.with_suffix(".session"), base_path.with_suffix(".session-journal")]
+        for item in candidates:
+            try:
+                if item.exists():
+                    item.unlink()
+            except OSError:
+                continue
+
     async def begin_login(self, label: str, phone: str) -> tuple[str, str]:
         session_file = f"{slugify(label)}-{int(datetime.utcnow().timestamp())}"
         client = self.build_client(session_file)

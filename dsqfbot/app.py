@@ -339,6 +339,16 @@ class DsqfBotApp:
                     self.db.update_session(session_id, status="offline", last_error=self.telethon.describe_error(exc))
                     await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
                 return
+            if data.startswith("account:delete:"):
+                session_id = int(data.split(":")[-1])
+                session_row = self.db.get_session(session_id)
+                if not session_row:
+                    await self.render(update, "账号不存在。")
+                    return
+                self.telethon.delete_session_files(session_row["session_file"])
+                self.db.delete_session(session_id)
+                await self.render(update, f"账号已删除：{session_row['label']}", self.accounts_keyboard())
+                return
             if data.startswith("account:groups:"):
                 session_id = int(data.split(":")[-1])
                 await self.render(update, self.groups_text(session_id), self.groups_keyboard(session_id))
@@ -496,6 +506,7 @@ class DsqfBotApp:
                     InlineKeyboardButton("刷新账号", callback_data=f"account:refresh:{session_id}"),
                     InlineKeyboardButton("同步群组", callback_data=f"account:sync:{session_id}"),
                 ],
+                [InlineKeyboardButton("删除账号", callback_data=f"account:delete:{session_id}")],
                 [InlineKeyboardButton("查看群组", callback_data=f"account:groups:{session_id}")],
                 [InlineKeyboardButton("返回账号列表", callback_data="accounts")],
             ]
