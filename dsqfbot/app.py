@@ -722,7 +722,9 @@ class DsqfBotApp:
                     f"跳过：{skipped}\n"
                     f"失败：{failed}"
                 )
-                await self.render(update, f"{summary}\n\n{self.groups_text(session_id)}", self.groups_keyboard(session_id))
+                final_text = f"{summary}\n\n{self.groups_text(session_id)}"
+                if not await self.edit_message(progress_message, final_text, self.groups_keyboard(session_id)):
+                    await self.render(update, final_text, self.groups_keyboard(session_id))
                 return
             if data.startswith("group:view:"):
                 group_id = int(data.split(":")[-1])
