@@ -495,7 +495,7 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT * FROM tasks
-                WHERE repeat_mode='daily' AND status='scheduled' AND next_run_at IS NOT NULL AND next_run_at <= ?
+                WHERE repeat_mode LIKE 'daily%' AND status='scheduled' AND next_run_at IS NOT NULL AND next_run_at <= ?
                 ORDER BY next_run_at ASC, id ASC
                 """,
                 (cutoff_iso,),

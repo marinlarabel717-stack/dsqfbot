@@ -400,12 +400,11 @@ class DsqfBotApp:
                         self.state_cancel_keyboard(),
                     )
                     return
-                payload["repeat_mode"] = f"interval:{interval_minutes}"
+                repeat_prefix = payload.get("custom_repeat_prefix", "interval")
+                payload.pop("custom_repeat_prefix", None)
+                payload["repeat_mode"] = f"{repeat_prefix}:{interval_minutes}"
                 self.db.set_user_state(user_id, "wait_schedule_time", payload)
-                prompt = (
-                    "把第一条发送时间发给我，格式：2026-09-06 10:30\n"
-                    f"当前模式：每 {interval_minutes} 分钟自动往后排，直到 Telegram 定时上限"
-                )
+                prompt = self.batch_schedule_prompt(payload["repeat_mode"], interval_minutes)
                 prompt_message = await self.render_message(update, prompt, self.state_cancel_keyboard())
                 if prompt_message:
                     payload["prompt_chat_id"] = getattr(prompt_message, "chat_id", None)
@@ -427,11 +426,14 @@ class DsqfBotApp:
                 progress_message = None
                 progress_chat_id = payload.get("prompt_chat_id")
                 progress_message_id = payload.get("prompt_message_id")
+                interval_minutes = self.batch_interval_minutes(payload["repeat_mode"])
+                daily_repeat = self.is_daily_repeat_mode(payload["repeat_mode"])
                 try:
-                    interval_minutes = self.interval_repeat_minutes(payload["repeat_mode"])
                     if interval_minutes is not None:
+                        repeat_text = "每天重复" if daily_repeat else "单次"
                         initial_text = (
                             "批量定时创建中：0/?\n"
+                            f"每条：{repeat_text}\n"
                             f"间隔：每 {interval_minutes} 分钟\n"
                             "正在读取当前已设定时，并准备批量创建..."
                         )
@@ -467,6 +469,7 @@ class DsqfBotApp:
                             await update_progress_text(
                                 (
                                     f"批量定时创建中：{created}/{total}\n"
+                                    f"每条：{repeat_text}\n"
                                     f"间隔：每 {interval_minutes} 分钟\n"
                                     f"当前排到：{format_dt(current_when.isoformat(), self.config.default_timezone)}"
                                 ),
@@ -480,6 +483,7 @@ class DsqfBotApp:
                                 message_text=payload["message_text"],
                                 first_when=when,
                                 interval_minutes=interval_minutes,
+                                repeat_mode=payload["repeat_mode"],
                                 progress_callback=report_progress_v2,
                             )
                         except Exception as exc:
@@ -494,6 +498,7 @@ class DsqfBotApp:
                         last_when = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
                         final_text = (
                             f"批量定时创建成功，共 {len(task_ids)} / {total} 条。\n"
+                            f"每条：{repeat_text}\n"
                             f"间隔：每 {interval_minutes} 分钟\n"
                             f"开始：{format_dt(when.isoformat(), self.config.default_timezone)}\n"
                             f"最后一条：{format_dt(last_when.isoformat(), self.config.default_timezone)}"
@@ -501,50 +506,11 @@ class DsqfBotApp:
                         if not await update_progress_text(final_text, self.tasks_keyboard()):
                             await self.render(update, final_text, self.tasks_keyboard())
                         return
-                        if update.effective_message:
-                            progress_message = await update.effective_message.reply_text("正在读取当前已设定时，并准备批量创建…")
-
-                        async def report_progress(created: int, total: int, current_when: datetime) -> None:
-                            progress_state["created"] = created
-                            progress_state["total"] = total
-                            progress_state["last_when"] = current_when
-                            if not progress_message:
-                                return
-                            if created not in {1, total} and created % 5 != 0:
-                                return
-                            await self.edit_message(
-                                progress_message,
-                                (
-                                    f"批量定时创建中：{created}/{total}\n"
-                                    f"间隔：每 {interval_minutes} 分钟\n"
-                                    f"当前排到：{format_dt(current_when.isoformat(), self.config.default_timezone)}"
-                                ),
-                            )
-
-                        task_ids, total = await self.create_interval_schedule_batch(
-                            session_row=session_row,
-                            group_row=group_row,
-                            message_text=payload["message_text"],
-                            first_when=when,
-                            interval_minutes=interval_minutes,
-                            progress_callback=report_progress,
-                        )
-                        self.db.clear_user_state(user_id)
-                        last_when = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
-                        final_text = (
-                            f"批量定时创建成功，共 {len(task_ids)} / {total} 条。\n"
-                            f"间隔：每 {interval_minutes} 分钟\n"
-                            f"开始：{format_dt(when.isoformat(), self.config.default_timezone)}\n"
-                            f"最后一条：{format_dt(last_when.isoformat(), self.config.default_timezone)}"
-                        )
-                        if not await self.edit_message(progress_message, final_text, self.tasks_keyboard()):
-                            await self.render(update, final_text, self.tasks_keyboard())
-                        return
 
                     message_id = await self.telethon.schedule_message(session_row, group_row, payload["message_text"], when)
                     next_run_at = None
                     last_scheduled_for = when.isoformat()
-                    if payload["repeat_mode"] == "daily":
+                    if daily_repeat:
                         next_run_at = self.telethon.next_daily_run(when).isoformat()
                     task_id = self.db.create_task(
                         session_id=session_row["id"],
@@ -738,7 +704,8 @@ class DsqfBotApp:
                     await self.render(update, "当前没有待创建的定时任务。")
                     return
                 repeat_mode = data.removeprefix("schedule:repeat:")
-                if repeat_mode == "interval:custom":
+                if repeat_mode in {"interval:custom", "daily_interval:custom"}:
+                    payload["custom_repeat_prefix"] = "daily_interval" if repeat_mode.startswith("daily_interval:") else "interval"
                     self.db.set_user_state(user_id, "wait_schedule_interval", payload)
                     await self.render(
                         update,
@@ -748,12 +715,9 @@ class DsqfBotApp:
                     return
                 payload["repeat_mode"] = repeat_mode
                 self.db.set_user_state(user_id, "wait_schedule_time", payload)
-                interval_minutes = self.interval_repeat_minutes(repeat_mode)
+                interval_minutes = self.batch_interval_minutes(repeat_mode)
                 if interval_minutes is not None:
-                    prompt = (
-                        "把第一条发送时间发给我，格式：2026-09-06 10:30\n"
-                        f"当前模式：每 {interval_minutes} 分钟自动往后排，直到 Telegram 定时上限"
-                    )
+                    prompt = self.batch_schedule_prompt(repeat_mode, interval_minutes)
                 else:
                     prompt = f"把发送时间发给我，格式：2026-09-06 10:30\n当前重复：{self.repeat_mode_text(repeat_mode)}"
                 prompt_message = await self.render_message(update, prompt, self.state_cancel_keyboard())
@@ -950,12 +914,24 @@ class DsqfBotApp:
         ]
         if allow_daily:
             rows.append([InlineKeyboardButton("每天重复", callback_data="schedule:repeat:daily")])
+            rows.append(
+                [
+                    InlineKeyboardButton("每天排满 5 分钟", callback_data="schedule:repeat:daily_interval:5"),
+                    InlineKeyboardButton("每天排满 10 分钟", callback_data="schedule:repeat:daily_interval:10"),
+                ]
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton("每天排满 30 分钟", callback_data="schedule:repeat:daily_interval:30"),
+                    InlineKeyboardButton("每天排满自定义", callback_data="schedule:repeat:daily_interval:custom"),
+                ]
+            )
         rows.append([InlineKeyboardButton("返回首页", callback_data="home")])
         return InlineKeyboardMarkup(rows)
 
     @staticmethod
-    def interval_repeat_minutes(repeat_mode: str) -> int | None:
-        if not repeat_mode.startswith("interval:"):
+    def batch_interval_minutes(repeat_mode: str) -> int | None:
+        if not (repeat_mode.startswith("interval:") or repeat_mode.startswith("daily_interval:")):
             return None
         try:
             minutes = int(repeat_mode.split(":")[-1])
@@ -963,11 +939,28 @@ class DsqfBotApp:
             return None
         return minutes if minutes > 0 else None
 
+    @staticmethod
+    def is_daily_repeat_mode(repeat_mode: str) -> bool:
+        return repeat_mode == "daily" or repeat_mode.startswith("daily_interval:")
+
+    def batch_schedule_prompt(self, repeat_mode: str, interval_minutes: int) -> str:
+        if self.is_daily_repeat_mode(repeat_mode):
+            return (
+                "把第一条发送时间发给我，格式：2026-09-06 10:30\n"
+                f"当前模式：每条都设为每天重复，并按每 {interval_minutes} 分钟自动往后排，直到 Telegram 定时上限"
+            )
+        return (
+            "把第一条发送时间发给我，格式：2026-09-06 10:30\n"
+            f"当前模式：每 {interval_minutes} 分钟自动往后排，直到 Telegram 定时上限"
+        )
+
     def repeat_mode_text(self, repeat_mode: str) -> str:
         if repeat_mode == "daily":
             return "每天"
-        interval_minutes = self.interval_repeat_minutes(repeat_mode)
+        interval_minutes = self.batch_interval_minutes(repeat_mode)
         if interval_minutes is not None:
+            if self.is_daily_repeat_mode(repeat_mode):
+                return f"每天重复（每 {interval_minutes} 分钟排满）"
             return f"每 {interval_minutes} 分钟排满"
         return "单次"
 
@@ -978,6 +971,7 @@ class DsqfBotApp:
         message_text: str,
         first_when: datetime,
         interval_minutes: int,
+        repeat_mode: str,
         progress_callback: Callable[[int, int, datetime], Awaitable[None]] | None = None,
     ) -> tuple[list[int], int]:
         existing = await self.telethon.list_scheduled_messages(session_row, group_row)
@@ -986,6 +980,7 @@ class DsqfBotApp:
             raise RuntimeError("这个群的 Telegram 已设定时已经到上限了")
 
         created_task_ids: list[int] = []
+        daily_repeat = self.is_daily_repeat_mode(repeat_mode)
         for offset in range(remaining):
             when = first_when + timedelta(minutes=interval_minutes * offset)
             message_id = await self.telethon.schedule_message(session_row, group_row, message_text, when)
@@ -994,8 +989,8 @@ class DsqfBotApp:
                 group_id=group_row["id"],
                 message_text=message_text,
                 schedule_at=when.isoformat(),
-                repeat_mode="once",
-                next_run_at=None,
+                repeat_mode=repeat_mode,
+                next_run_at=self.telethon.next_daily_run(when).isoformat() if daily_repeat else None,
                 last_scheduled_for=when.isoformat(),
                 last_telegram_message_id=message_id,
                 status="scheduled",
