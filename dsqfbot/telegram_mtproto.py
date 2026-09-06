@@ -310,6 +310,23 @@ class TelethonManager:
         finally:
             await client.disconnect()
 
+    async def leave_group(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> None:
+        client = self.build_client(session_row["session_file"])
+        await client.connect()
+        try:
+            if not await client.is_user_authorized():
+                raise RuntimeError("账号掉线")
+            entity = await self._resolve_entity(client, group_row)
+            try:
+                if getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False):
+                    await client(functions.channels.LeaveChannelRequest(entity))
+                else:
+                    await client.delete_dialog(entity)
+            except Exception:
+                await client.delete_dialog(entity)
+        finally:
+            await client.disconnect()
+
     async def _resolve_entity(self, client: TelegramClient, group_row: dict[str, Any]):
         if group_row.get("username"):
             return await client.get_entity(group_row["username"])

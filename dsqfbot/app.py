@@ -656,6 +656,46 @@ class DsqfBotApp:
                 session_id = int(data.split(":")[-1])
                 await self.render(update, self.groups_text(session_id), self.groups_keyboard(session_id))
                 return
+            if data.startswith("groups:leave_unsendable:"):
+                session_id = int(data.split(":")[-1])
+                session_row = self.db.get_session(session_id)
+                if not session_row:
+                    await self.render(update, "账号不存在。")
+                    return
+                groups = self.db.list_groups(session_id)
+                if not groups:
+                    await self.render(update, "这个账号还没有同步到群，先点“同步群组”。", self.groups_keyboard(session_id))
+                    return
+                await self.render(update, "正在检查并退出无法发送的群，请稍等...")
+                checked = 0
+                left_count = 0
+                skipped = 0
+                failed = 0
+                for group_row in groups:
+                    checked += 1
+                    try:
+                        result = await self.telethon.detect_group_status(session_row, group_row)
+                        self.db.update_group(group_row["id"], **result)
+                        if result.get("join_status") == "joined" and result.get("speak_status") != "正常可发":
+                            await self.telethon.leave_group(session_row, group_row)
+                            self.db.update_group(group_row["id"], join_status="left", speak_status="已退出", last_error="")
+                            left_count += 1
+                        else:
+                            skipped += 1
+                    except Exception as exc:
+                        message = self.telethon.describe_error(exc)
+                        self.db.update_group(group_row["id"], last_error=message)
+                        if message == "账号掉线":
+                            self.db.update_session(session_id, status="offline", last_error=message)
+                        failed += 1
+                summary = (
+                    f"检查完成：共 {checked} 个群\n"
+                    f"已退出：{left_count}\n"
+                    f"跳过：{skipped}\n"
+                    f"失败：{failed}"
+                )
+                await self.render(update, f"{summary}\n\n{self.groups_text(session_id)}", self.groups_keyboard(session_id))
+                return
             if data.startswith("group:view:"):
                 group_id = int(data.split(":")[-1])
                 await self.render(update, self.group_detail_text(group_id), self.group_detail_keyboard(group_id))
@@ -872,6 +912,7 @@ class DsqfBotApp:
     def groups_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
         groups = self.db.list_groups(session_id)[:20]
         rows = [[InlineKeyboardButton(item["title"][:40], callback_data=f"group:view:{item['id']}")] for item in groups]
+        rows.append([InlineKeyboardButton("一键退出无法发送的群", callback_data=f"groups:leave_unsendable:{session_id}")])
         rows.append([InlineKeyboardButton("返回账号详情", callback_data=f"account:view:{session_id}")])
         return InlineKeyboardMarkup(rows)
 
