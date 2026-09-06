@@ -177,7 +177,7 @@ class DsqfBotApp:
 
     async def send_home(self, update: Update) -> None:
         sessions = self.db.list_sessions()
-        groups_count = sum(len(self.db.list_groups(item["id"])) for item in sessions)
+        groups_count = sum(len(self.visible_groups(item["id"])) for item in sessions)
         text = (
             "dsqfbot 面板\n\n"
             f"账号数：{len(sessions)}\n"
@@ -662,9 +662,9 @@ class DsqfBotApp:
                 if not session_row:
                     await self.render(update, "账号不存在。")
                     return
-                groups = self.db.list_groups(session_id)
+                groups = self.visible_groups(session_id)
                 if not groups:
-                    await self.render(update, "这个账号还没有同步到群，先点“同步群组”。", self.groups_keyboard(session_id))
+                    await self.render(update, "这个账号当前没有可检查的在群群组。", self.groups_keyboard(session_id))
                     return
                 progress_message = await self.render_message(
                     update,
@@ -930,9 +930,9 @@ class DsqfBotApp:
         )
 
     def groups_text(self, session_id: int) -> str:
-        groups = self.db.list_groups(session_id)
+        groups = self.visible_groups(session_id)
         if not groups:
-            return "这个账号还没有同步到群，先点“同步群组”。"
+            return "这个账号当前没有显示中的在群群组。"
         lines = ["群组列表（最近 20 个）"]
         for item in groups[:20]:
             group_link = item["link"] or (f"https://t.me/{item['username']}" if item.get("username") else "-")
@@ -940,11 +940,14 @@ class DsqfBotApp:
         return "\n".join(lines)
 
     def groups_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
-        groups = self.db.list_groups(session_id)[:20]
+        groups = self.visible_groups(session_id)[:20]
         rows = [[InlineKeyboardButton(item["title"][:40], callback_data=f"group:view:{item['id']}")] for item in groups]
         rows.append([InlineKeyboardButton("一键退出无法发送的群", callback_data=f"groups:leave_unsendable:{session_id}")])
         rows.append([InlineKeyboardButton("返回账号详情", callback_data=f"account:view:{session_id}")])
         return InlineKeyboardMarkup(rows)
+
+    def visible_groups(self, session_id: int) -> list[dict[str, Any]]:
+        return [item for item in self.db.list_groups(session_id) if item.get("join_status") != "left"]
 
     def group_detail_text(self, group_id: int) -> str:
         group = self.db.get_group(group_id)
