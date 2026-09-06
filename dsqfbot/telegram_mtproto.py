@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, errors, functions
-from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
     DeleteScheduledMessagesRequest,
@@ -242,7 +242,16 @@ class TelethonManager:
         await client.connect()
         try:
             entity = await self._resolve_entity(client, group_row)
-            message = await client.send_message(entity, message_text, schedule=when)
+            try:
+                message = await client.send_message(entity, message_text, schedule=when)
+            except Exception as exc:
+                error_message = self.describe_error(exc)
+                if error_message != "无发言权限":
+                    raise
+                joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
+                if not joined:
+                    raise RuntimeError(note or error_message)
+                message = await client.send_message(entity, message_text, schedule=when)
             return int(message.id)
         finally:
             await client.disconnect()
@@ -292,21 +301,29 @@ class TelethonManager:
             if getattr(permissions, "has_left", False):
                 return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
             if getattr(permissions, "send_messages", None) is False:
-                return {"join_status": "joined", "speak_status": "无发言权限", "last_error": "无发言权限"}
-            try:
-                probe_message = await client.send_message(entity, random.choice(PROBE_EMOJIS))
-            except Exception as exc:
-                message = self.describe_error(exc)
-                if message == "账号掉线":
-                    raise
-                if message == "未加入群":
-                    return {"join_status": "not_joined", "speak_status": message, "last_error": message}
-                return {"join_status": "joined", "speak_status": message, "last_error": message}
-            try:
-                await client.delete_messages(entity, [probe_message.id])
-            except Exception:
-                pass
-            return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
+                joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
+                if not joined:
+                    message = note or "无发言权限"
+                    return {"join_status": "joined", "speak_status": message, "last_error": message}
+                permissions = await client.get_permissions(entity, "me")
+                if getattr(permissions, "is_banned", False):
+                    return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
+                if getattr(permissions, "has_left", False):
+                    return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
+            probe_ok, probe_error = await self._probe_send_message(client, entity)
+            if probe_ok:
+                return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
+            if probe_error == "无发言权限":
+                joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
+                if joined:
+                    probe_ok, probe_error = await self._probe_send_message(client, entity)
+                    if probe_ok:
+                        return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
+                elif note:
+                    probe_error = note
+            if probe_error == "未加入群":
+                return {"join_status": "not_joined", "speak_status": probe_error, "last_error": probe_error}
+            return {"join_status": "joined", "speak_status": probe_error or "无发言权限", "last_error": probe_error or "无发言权限"}
         finally:
             await client.disconnect()
 
@@ -335,6 +352,51 @@ class TelethonManager:
         if group_row.get("link"):
             return await client.get_entity(group_row["link"])
         raise errors.UserNotParticipantError(request=None)
+
+    async def _probe_send_message(self, client: TelegramClient, entity: Any) -> tuple[bool, str | None]:
+        try:
+            probe_message = await client.send_message(entity, random.choice(PROBE_EMOJIS))
+        except Exception as exc:
+            message = self.describe_error(exc)
+            if message == "账号掉线":
+                raise
+            return False, message
+        try:
+            await client.delete_messages(entity, [probe_message.id])
+        except Exception:
+            pass
+        return True, None
+
+    async def _auto_join_linked_channel_for_speaking(self, client: TelegramClient, entity: Any) -> tuple[bool, str | None]:
+        if not (getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False)):
+            return False, None
+        try:
+            full = await client(GetFullChannelRequest(entity))
+        except Exception:
+            return False, None
+        linked_chat_id = int(getattr(getattr(full, "full_chat", None), "linked_chat_id", 0) or 0)
+        if linked_chat_id <= 0:
+            return False, None
+        linked_entity = None
+        for chat in getattr(full, "chats", []) or []:
+            if int(getattr(chat, "id", 0) or 0) == linked_chat_id:
+                linked_entity = chat
+                break
+        if linked_entity is None:
+            try:
+                linked_entity = await client.get_entity(linked_chat_id)
+            except Exception as exc:
+                return False, f"关联频道解析失败：{self.describe_error(exc)}"
+        title = getattr(linked_entity, "title", None) or getattr(linked_entity, "username", None) or str(linked_chat_id)
+        try:
+            await client(JoinChannelRequest(linked_entity))
+            return True, f"已自动关注关联频道：{title}"
+        except errors.UserAlreadyParticipantError:
+            return True, f"已关注关联频道：{title}"
+        except errors.InviteRequestSentError:
+            return False, f"关联频道需审批：{title}"
+        except Exception as exc:
+            return False, f"关注关联频道失败：{self.describe_error(exc)}"
 
     def next_daily_run(self, when: datetime) -> datetime:
         return when + timedelta(days=1)
