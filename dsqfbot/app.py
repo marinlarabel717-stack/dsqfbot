@@ -865,7 +865,8 @@ class DsqfBotApp:
             return "这个账号还没有同步到群，先点“同步群组”。"
         lines = ["群组列表（最近 20 个）"]
         for item in groups[:20]:
-            lines.append(f"{item['id']}. {item['title']} | {self.human_join_status(item['join_status'])} | {item['speak_status']}")
+            group_link = item["link"] or (f"https://t.me/{item['username']}" if item.get("username") else "-")
+            lines.append(f"{item['id']}. {item['title']} | {group_link} | {self.human_join_status(item['join_status'])} | {item['speak_status']}")
         return "\n".join(lines)
 
     def groups_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
@@ -878,9 +879,11 @@ class DsqfBotApp:
         group = self.db.get_group(group_id)
         if not group:
             return "群不存在。"
+        group_link = group["link"] or (f"https://t.me/{group['username']}" if group.get("username") else "-")
         return (
             f"群名：{group['title']}\n"
             f"用户名：{group['username'] or '-'}\n"
+            f"群链接：{group_link}\n"
             f"加入状态：{self.human_join_status(group['join_status'])}\n"
             f"发言状态：{group['speak_status']}\n"
             f"错误：{group['last_error'] or '-'}"
