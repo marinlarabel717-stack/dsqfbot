@@ -666,13 +666,25 @@ class DsqfBotApp:
                 if not groups:
                     await self.render(update, "这个账号还没有同步到群，先点“同步群组”。", self.groups_keyboard(session_id))
                     return
-                await self.render(update, "正在检查并退出无法发送的群，请稍等...")
+                progress_message = await self.render_message(
+                    update,
+                    self.leave_unsendable_progress_text(
+                        checked=0,
+                        total=len(groups),
+                        left_count=0,
+                        skipped=0,
+                        failed=0,
+                        current_group=None,
+                        current_action="正在准备检查...",
+                    ),
+                )
                 checked = 0
                 left_count = 0
                 skipped = 0
                 failed = 0
                 for group_row in groups:
                     checked += 1
+                    current_title = group_row["title"]
                     try:
                         result = await self.telethon.detect_group_status(session_row, group_row)
                         self.db.update_group(group_row["id"], **result)
@@ -680,14 +692,30 @@ class DsqfBotApp:
                             await self.telethon.leave_group(session_row, group_row)
                             self.db.update_group(group_row["id"], join_status="left", speak_status="已退出", last_error="")
                             left_count += 1
+                            current_action = f"已退出 | {result.get('speak_status') or '无法发送'}"
                         else:
                             skipped += 1
+                            current_action = f"跳过 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
                     except Exception as exc:
                         message = self.telethon.describe_error(exc)
                         self.db.update_group(group_row["id"], last_error=message)
                         if message == "账号掉线":
                             self.db.update_session(session_id, status="offline", last_error=message)
                         failed += 1
+                        current_action = f"失败 | {message}"
+                    if checked in {1, len(groups)} or checked % 3 == 0:
+                        await self.edit_message(
+                            progress_message,
+                            self.leave_unsendable_progress_text(
+                                checked=checked,
+                                total=len(groups),
+                                left_count=left_count,
+                                skipped=skipped,
+                                failed=failed,
+                                current_group=current_title,
+                                current_action=current_action,
+                            ),
+                        )
                 summary = (
                     f"检查完成：共 {checked} 个群\n"
                     f"已退出：{left_count}\n"
@@ -1132,6 +1160,28 @@ class DsqfBotApp:
             lines.append(f"原因：{recent_failures[0]['last_error']}")
         if done >= total and total > 0:
             lines[0] = f"批量加群已完成：{done}/{total}"
+        return "\n".join(lines)
+
+    @staticmethod
+    def leave_unsendable_progress_text(
+        checked: int,
+        total: int,
+        left_count: int,
+        skipped: int,
+        failed: int,
+        current_group: str | None,
+        current_action: str,
+    ) -> str:
+        lines = [
+            f"正在检查并退出无法发送的群：{checked}/{total}",
+            f"已退出：{left_count}",
+            f"跳过：{skipped}",
+            f"失败：{failed}",
+        ]
+        if current_group:
+            lines.append(f"当前：{current_group}")
+        if current_action:
+            lines.append(f"状态：{current_action}")
         return "\n".join(lines)
 
     def join_jobs_text(self) -> str:
