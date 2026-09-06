@@ -821,8 +821,8 @@ class DsqfBotApp:
         if not sessions:
             return "还没有账号，先点“添加账号”。"
         lines = ["账号列表"]
-        for item in sessions:
-            lines.append(f"{item['id']}. {item['label']} | {item['phone']} | {'Premium' if item['is_premium'] else '普通'} | {self.human_session_status(item['status'])}")
+        for index, item in enumerate(sessions, start=1):
+            lines.append(f"{index}. {item['label']} | {item['phone']} | {'Premium' if item['is_premium'] else '普通'} | {self.human_session_status(item['status'])}")
         return "\n".join(lines)
 
     def accounts_keyboard(self) -> InlineKeyboardMarkup:
