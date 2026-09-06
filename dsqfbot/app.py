@@ -341,6 +341,35 @@ class DsqfBotApp:
                 self.db.set_user_state(user_id, "wait_schedule_repeat", payload)
                 await self.render(update, "选择重复方式。", self.repeat_keyboard(bool(session_row["is_premium"])))
                 return
+            if state == "wait_schedule_interval":
+                interval_text = text.strip()
+                if not interval_text.isdigit():
+                    await self.render(
+                        update,
+                        "把自定义间隔分钟数发给我，例如：7 或 15",
+                        self.state_cancel_keyboard(),
+                    )
+                    return
+                interval_minutes = int(interval_text)
+                if interval_minutes <= 0 or interval_minutes > 1440:
+                    await self.render(
+                        update,
+                        "自定义间隔需要在 1 到 1440 分钟之间。",
+                        self.state_cancel_keyboard(),
+                    )
+                    return
+                payload["repeat_mode"] = f"interval:{interval_minutes}"
+                self.db.set_user_state(user_id, "wait_schedule_time", payload)
+                prompt = (
+                    "把第一条发送时间发给我，格式：2026-09-06 10:30\n"
+                    f"当前模式：每 {interval_minutes} 分钟自动往后排，直到 Telegram 定时上限"
+                )
+                prompt_message = await self.render_message(update, prompt, self.state_cancel_keyboard())
+                if prompt_message:
+                    payload["prompt_chat_id"] = getattr(prompt_message, "chat_id", None)
+                    payload["prompt_message_id"] = getattr(prompt_message, "message_id", None)
+                    self.db.set_user_state(user_id, "wait_schedule_time", payload)
+                return
             if state == "wait_schedule_time":
                 when = parse_user_datetime(text, self.config.default_timezone)
                 if when <= datetime.now(tz=ZoneInfo(self.config.default_timezone)):
@@ -667,6 +696,14 @@ class DsqfBotApp:
                     await self.render(update, "当前没有待创建的定时任务。")
                     return
                 repeat_mode = data.removeprefix("schedule:repeat:")
+                if repeat_mode == "interval:custom":
+                    self.db.set_user_state(user_id, "wait_schedule_interval", payload)
+                    await self.render(
+                        update,
+                        "把自定义间隔分钟数发给我，例如：7 或 15",
+                        self.state_cancel_keyboard(),
+                    )
+                    return
                 payload["repeat_mode"] = repeat_mode
                 self.db.set_user_state(user_id, "wait_schedule_time", payload)
                 interval_minutes = self.interval_repeat_minutes(repeat_mode)
@@ -853,7 +890,10 @@ class DsqfBotApp:
                 InlineKeyboardButton("每 5 分钟排满", callback_data="schedule:repeat:interval:5"),
                 InlineKeyboardButton("每 10 分钟排满", callback_data="schedule:repeat:interval:10"),
             ],
-            [InlineKeyboardButton("每 30 分钟排满", callback_data="schedule:repeat:interval:30")],
+            [
+                InlineKeyboardButton("每 30 分钟排满", callback_data="schedule:repeat:interval:30"),
+                InlineKeyboardButton("自定义间隔排满", callback_data="schedule:repeat:interval:custom"),
+            ],
         ]
         if allow_daily:
             rows.append([InlineKeyboardButton("每天重复", callback_data="schedule:repeat:daily")])

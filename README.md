@@ -18,7 +18,7 @@
   - no speaking permission
   - real send-probe result using a temporary random emoji
 - Create scheduled Telegram messages
-- Batch-fill scheduled messages at 5/10/30 minute intervals until the Telegram cap
+- Batch-fill scheduled messages at 5/10/30 minute intervals or a custom minute interval until the Telegram cap
 - Daily repeat support for premium-capable accounts via rolling future scheduling
 - View queued join jobs
 - View saved scheduled tasks
