@@ -69,6 +69,7 @@ class Database:
 
                 CREATE TABLE IF NOT EXISTS join_jobs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER,
                     session_id INTEGER NOT NULL,
                     link TEXT NOT NULL,
                     mode TEXT NOT NULL DEFAULT 'balanced',
@@ -79,8 +80,20 @@ class Database:
                     last_error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
+                    FOREIGN KEY(batch_id) REFERENCES join_batches(id),
                     FOREIGN KEY(session_id) REFERENCES sessions(id),
                     FOREIGN KEY(group_id) REFERENCES groups(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS join_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mode TEXT NOT NULL DEFAULT 'balanced',
+                    interval_seconds INTEGER NOT NULL,
+                    total_jobs INTEGER NOT NULL DEFAULT 0,
+                    notify_chat_id INTEGER,
+                    notify_message_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS tasks (
@@ -102,6 +115,13 @@ class Database:
                 );
                 """
             )
+            self._ensure_column(conn, "join_jobs", "batch_id", "INTEGER")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_sql: str) -> None:
+        columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_sql}")
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -233,15 +253,104 @@ class Database:
         with self.connect() as conn:
             conn.execute(f"UPDATE groups SET {keys} WHERE id = ?", (*fields.values(), group_id))
 
-    def create_join_job(self, session_id: int, link: str, mode: str, scheduled_at: str) -> int:
+    def create_join_batch(
+        self,
+        mode: str,
+        interval_seconds: int,
+        total_jobs: int,
+        notify_chat_id: int | None = None,
+        notify_message_id: int | None = None,
+    ) -> int:
         now = now_iso()
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO join_jobs (session_id, link, mode, scheduled_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO join_batches (
+                    mode, interval_seconds, total_jobs, notify_chat_id, notify_message_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, link, mode, scheduled_at, now, now),
+                (mode, interval_seconds, total_jobs, notify_chat_id, notify_message_id, now, now),
+            )
+            return int(cur.lastrowid)
+
+    def update_join_batch(self, batch_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        fields["updated_at"] = now_iso()
+        keys = ", ".join(f"{key}=?" for key in fields)
+        with self.connect() as conn:
+            conn.execute(f"UPDATE join_batches SET {keys} WHERE id = ?", (*fields.values(), batch_id))
+
+    def get_join_batch(self, batch_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM join_batches WHERE id = ?", (batch_id,)).fetchone()
+        return self._row_to_dict(row)
+
+    def join_batch_stats(self, batch_id: int) -> dict[str, int]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status = 'retry' THEN 1 ELSE 0 END) AS retry,
+                    SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+                    SUM(CASE WHEN status = 'joined' THEN 1 ELSE 0 END) AS joined,
+                    SUM(CASE WHEN status = 'awaiting_approval' THEN 1 ELSE 0 END) AS awaiting_approval,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+                FROM join_jobs
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+        if not row:
+            return {
+                "total": 0,
+                "pending": 0,
+                "retry": 0,
+                "running": 0,
+                "joined": 0,
+                "awaiting_approval": 0,
+                "failed": 0,
+            }
+        return {key: int(row[key] or 0) for key in row.keys()}
+
+    def join_job_stats(self) -> dict[str, int]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                    SUM(CASE WHEN status = 'retry' THEN 1 ELSE 0 END) AS retry,
+                    SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+                    SUM(CASE WHEN status = 'joined' THEN 1 ELSE 0 END) AS joined,
+                    SUM(CASE WHEN status = 'awaiting_approval' THEN 1 ELSE 0 END) AS awaiting_approval,
+                    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+                FROM join_jobs
+                """
+            ).fetchone()
+        if not row:
+            return {
+                "total": 0,
+                "pending": 0,
+                "retry": 0,
+                "running": 0,
+                "joined": 0,
+                "awaiting_approval": 0,
+                "failed": 0,
+            }
+        return {key: int(row[key] or 0) for key in row.keys()}
+
+    def create_join_job(self, session_id: int, link: str, mode: str, scheduled_at: str, batch_id: int | None = None) -> int:
+        now = now_iso()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO join_jobs (batch_id, session_id, link, mode, scheduled_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (batch_id, session_id, link, mode, scheduled_at, now, now),
             )
             return int(cur.lastrowid)
 

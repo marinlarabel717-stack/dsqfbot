@@ -30,9 +30,11 @@ class DsqfBotApp:
         self.config = config
         self.db = db
         self.telethon = telethon
+        self.application: Application | None = None
         self._tasks: list[asyncio.Task] = []
 
     async def on_startup(self, application: Application) -> None:
+        self.application = application
         self._tasks.append(asyncio.create_task(self.join_worker(), name="join-worker"))
         self._tasks.append(asyncio.create_task(self.repeat_worker(), name="repeat-worker"))
         LOGGER.info("workers started")
@@ -42,6 +44,7 @@ class DsqfBotApp:
             task.cancel()
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        self.application = None
         LOGGER.info("workers stopped")
 
     async def ensure_admin(self, update: Update) -> bool:
@@ -111,6 +114,45 @@ class DsqfBotApp:
         except Exception as exc:
             LOGGER.warning("edit message by ref failed: %s", exc)
         return False
+
+    async def edit_message_by_bot(
+        self,
+        chat_id: int | None,
+        message_id: int | None,
+        text: str,
+        keyboard: InlineKeyboardMarkup | None = None,
+    ) -> bool:
+        if not self.application or not chat_id or not message_id:
+            return False
+        try:
+            await self.application.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+            )
+            return True
+        except BadRequest as exc:
+            if "Message is not modified" in str(exc):
+                return True
+            LOGGER.warning("edit message by bot failed: %s", exc)
+        except Exception as exc:
+            LOGGER.warning("edit message by bot failed: %s", exc)
+        return False
+
+    async def refresh_join_batch_message(self, batch_id: int, final: bool = False) -> None:
+        batch = self.db.get_join_batch(batch_id)
+        if not batch:
+            return
+        text = self.join_batch_progress_text(batch_id)
+        if final and "批量加群已完成" not in text:
+            text = text.replace("批量加群进行中", "批量加群已完成", 1)
+        await self.edit_message_by_bot(
+            batch.get("notify_chat_id"),
+            batch.get("notify_message_id"),
+            text,
+            self.join_jobs_keyboard(),
+        )
 
     def state_cancel_keyboard(self) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([[InlineKeyboardButton("取消当前流程", callback_data="state:cancel")]])
@@ -757,9 +799,20 @@ class DsqfBotApp:
                     await self.render(update, "当前没有待执行的加群批次。")
                     return
                 interval = int(data.split(":")[-1])
-                summary = self.enqueue_join_jobs(payload, interval)
+                mode = payload.get("distribution", "balanced")
+                total_jobs = len(payload.get("links", [])) * (len(payload.get("session_ids", [])) if mode == "all" else 1)
+                batch_id = self.db.create_join_batch(mode=mode, interval_seconds=interval, total_jobs=total_jobs)
+                created, summary = self.enqueue_join_jobs(payload, interval, batch_id=batch_id)
+                self.db.update_join_batch(batch_id, total_jobs=created)
                 self.db.clear_user_state(user_id)
-                await self.render(update, summary, self.home_keyboard())
+                progress_text = self.join_batch_progress_text(batch_id)
+                progress_message = await self.render_message(update, f"{summary}\n\n{progress_text}", self.join_jobs_keyboard())
+                if progress_message:
+                    self.db.update_join_batch(
+                        batch_id,
+                        notify_chat_id=getattr(progress_message, "chat_id", None),
+                        notify_message_id=getattr(progress_message, "message_id", None),
+                    )
                 return
             if data == "join:list":
                 await self.render(update, self.join_jobs_text(), self.join_jobs_keyboard())
@@ -994,7 +1047,7 @@ class DsqfBotApp:
             ]
         )
 
-    def enqueue_join_jobs(self, payload: dict[str, Any], interval: int) -> str:
+    def enqueue_join_jobs(self, payload: dict[str, Any], interval: int, batch_id: int | None = None) -> tuple[int, str]:
         session_ids = payload["session_ids"]
         links = payload["links"]
         mode = payload.get("distribution", "balanced")
@@ -1004,25 +1057,58 @@ class DsqfBotApp:
             for index, link in enumerate(links):
                 for offset, session_id in enumerate(session_ids):
                     scheduled_at = (now + timedelta(seconds=interval * (created))).replace(microsecond=0).isoformat()
-                    self.db.create_join_job(session_id, link, mode, scheduled_at)
+                    self.db.create_join_job(session_id, link, mode, scheduled_at, batch_id=batch_id)
                     created += 1
         else:
             for index, link in enumerate(links):
                 session_id = session_ids[index % len(session_ids)]
                 scheduled_at = (now + timedelta(seconds=interval * created)).replace(microsecond=0).isoformat()
-                self.db.create_join_job(session_id, link, mode, scheduled_at)
+                self.db.create_join_job(session_id, link, mode, scheduled_at, batch_id=batch_id)
                 created += 1
-        return f"已创建 {created} 条加群任务，模式：{'全部都加' if mode == 'all' else '均分分配'}，间隔：{interval} 秒。"
+        return created, f"已创建 {created} 条加群任务，模式：{'全部都加' if mode == 'all' else '均分分配'}，间隔：{interval} 秒。"
+
+    def join_batch_progress_text(self, batch_id: int) -> str:
+        batch = self.db.get_join_batch(batch_id)
+        stats = self.db.join_batch_stats(batch_id)
+        total = int(batch["total_jobs"]) if batch else stats["total"]
+        done = stats["joined"] + stats["awaiting_approval"] + stats["failed"]
+        mode_text = "全部都加" if batch and batch["mode"] == "all" else "均分分配"
+        interval_seconds = int(batch["interval_seconds"]) if batch else 0
+        lines = [
+            f"批量加群进行中：{done}/{total}",
+            f"模式：{mode_text}",
+            f"间隔：{interval_seconds} 秒",
+            f"成功：{stats['joined']}",
+            f"待审批：{stats['awaiting_approval']}",
+            f"失败：{stats['failed']}",
+            f"排队中：{stats['pending']}",
+            f"重试中：{stats['retry']}",
+            f"执行中：{stats['running']}",
+        ]
+        recent_jobs = self.db.list_join_jobs(20)
+        recent_failures = [item for item in recent_jobs if item.get("batch_id") == batch_id and item["status"] == "failed" and item.get("last_error")]
+        if recent_failures:
+            lines.append("")
+            lines.append(f"最近失败：{recent_failures[0]['link']}")
+            lines.append(f"原因：{recent_failures[0]['last_error']}")
+        if done >= total and total > 0:
+            lines[0] = f"批量加群已完成：{done}/{total}"
+        return "\n".join(lines)
 
     def join_jobs_text(self) -> str:
         jobs = self.db.list_join_jobs()
         if not jobs:
             return "当前没有加群任务。"
-        lines = ["加群队列"]
+        stats = self.db.join_job_stats()
+        lines = [
+            "加群队列",
+            f"成功 {stats['joined']} | 待审批 {stats['awaiting_approval']} | 失败 {stats['failed']} | 排队中 {stats['pending']} | 重试中 {stats['retry']} | 执行中 {stats['running']}",
+        ]
         for item in jobs:
             session_row = self.db.get_session(item["session_id"])
             label = session_row["label"] if session_row else str(item["session_id"])
-            lines.append(f"{item['id']}. {label} | {self.human_join_job_status(item['status'])} | {item['link']}")
+            extra = f" | 原因：{item['last_error']}" if item.get("last_error") else ""
+            lines.append(f"{item['id']}. {label} | {self.human_join_job_status(item['status'])} | {item['link']}{extra}")
         return "\n".join(lines)
 
     def join_jobs_keyboard(self) -> InlineKeyboardMarkup:
@@ -1187,9 +1273,14 @@ class DsqfBotApp:
             if not job:
                 await asyncio.sleep(5)
                 continue
+            batch_id = job.get("batch_id")
+            if batch_id:
+                await self.refresh_join_batch_message(int(batch_id))
             session_row = self.db.get_session(job["session_id"])
             if not session_row:
                 self.db.finish_join_job(job["id"], "failed", last_error="账号不存在")
+                if batch_id:
+                    await self.refresh_join_batch_message(int(batch_id))
                 continue
             try:
                 result = await self.telethon.join_link(session_row, job["link"])
@@ -1204,14 +1295,20 @@ class DsqfBotApp:
                         join_status=result.get("join_status", "joined"),
                     )
                 self.db.finish_join_job(job["id"], result.get("join_status", "joined"), group_id=group_id)
+                if batch_id:
+                    await self.refresh_join_batch_message(int(batch_id))
             except Exception as exc:
                 message = self.telethon.describe_error(exc)
                 if "风控等待" in message:
                     retry_at = (datetime.utcnow() + timedelta(seconds=self.telethon.extract_wait_seconds(exc))).replace(microsecond=0).isoformat()
                     self.db.retry_join_job(job["id"], retry_at, message)
+                    if batch_id:
+                        await self.refresh_join_batch_message(int(batch_id))
                 else:
                     self.db.finish_join_job(job["id"], "failed", last_error=message)
                     self.db.update_session(session_row["id"], status="offline" if message == "账号掉线" else session_row["status"], last_error=message)
+                    if batch_id:
+                        await self.refresh_join_batch_message(int(batch_id))
             await asyncio.sleep(1)
 
     async def repeat_worker(self) -> None:

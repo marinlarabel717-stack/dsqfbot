@@ -10,6 +10,7 @@
 - Sync group/channel lists for each session
 - Batch import `t.me` links and enqueue join jobs
 - Smart join intervals to reduce aggressive join bursts
+- Batch join progress message with success/failure counts and visible failure reasons
 - Detect readable group status such as:
   - can speak
   - muted
