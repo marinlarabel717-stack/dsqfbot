@@ -417,6 +417,13 @@ class DsqfBotApp:
                     await self.render(update, "时间必须大于当前时间，格式：2026-09-06 10:30")
                     return
                 session_row = self.db.get_session(payload["session_id"])
+                if payload.get("target_scope") == "sendable_groups":
+                    if not session_row:
+                        self.db.clear_user_state(user_id)
+                        await self.render(update, "账号不存在。")
+                        return
+                    await self.create_sendable_groups_schedule_batch(update, context, user_id, session_row, payload, when)
+                    return
                 group_row = self.db.get_group(payload["group_id"])
                 if not session_row or not group_row:
                     self.db.clear_user_state(user_id)
@@ -655,6 +662,19 @@ class DsqfBotApp:
             if data.startswith("account:groups:"):
                 session_id = int(data.split(":")[-1])
                 await self.render(update, self.groups_text(session_id), self.groups_keyboard(session_id))
+                return
+            if data.startswith("groups:schedule_sendable:"):
+                session_id = int(data.split(":")[-1])
+                session_row = self.db.get_session(session_id)
+                if not session_row:
+                    await self.render(update, "账号不存在。")
+                    return
+                groups = self.visible_groups(session_id)
+                if not groups:
+                    await self.render(update, "这个账号当前没有可检查的在群群组。", self.groups_keyboard(session_id))
+                    return
+                self.db.set_user_state(user_id, "wait_schedule_message", {"session_id": session_id, "target_scope": "sendable_groups"})
+                await self.render(update, "把要同步到所有正常可发群的消息内容直接发给我。", self.state_cancel_keyboard())
                 return
             if data.startswith("groups:leave_unsendable:"):
                 session_id = int(data.split(":")[-1])
@@ -942,6 +962,7 @@ class DsqfBotApp:
     def groups_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
         groups = self.visible_groups(session_id)[:20]
         rows = [[InlineKeyboardButton(item["title"][:40], callback_data=f"group:view:{item['id']}")] for item in groups]
+        rows.append([InlineKeyboardButton("一键给正常可发群建定时", callback_data=f"groups:schedule_sendable:{session_id}")])
         rows.append([InlineKeyboardButton("一键退出无法发送的群", callback_data=f"groups:leave_unsendable:{session_id}")])
         rows.append([InlineKeyboardButton("返回账号详情", callback_data=f"account:view:{session_id}")])
         return InlineKeyboardMarkup(rows)
@@ -1077,6 +1098,173 @@ class DsqfBotApp:
                 await progress_callback(len(created_task_ids), remaining, when)
         return created_task_ids, remaining
 
+    async def create_sendable_groups_schedule_batch(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        session_row: dict[str, Any],
+        payload: dict[str, Any],
+        when: datetime,
+    ) -> None:
+        groups = self.visible_groups(session_row["id"])
+        if not groups:
+            self.db.clear_user_state(user_id)
+            await self.render(update, "这个账号当前没有可检查的在群群组。", self.groups_keyboard(session_row["id"]))
+            return
+
+        repeat_mode = payload["repeat_mode"]
+        repeat_text = self.repeat_mode_text(repeat_mode)
+        interval_minutes = self.batch_interval_minutes(repeat_mode)
+        daily_repeat = self.is_daily_repeat_mode(repeat_mode)
+        progress_message = None
+        progress_chat_id = payload.get("prompt_chat_id")
+        progress_message_id = payload.get("prompt_message_id")
+
+        async def update_progress_text(current_text: str, keyboard: InlineKeyboardMarkup | None = None) -> bool:
+            if await self.edit_message_ref(
+                context,
+                progress_chat_id,
+                progress_message_id,
+                current_text,
+                keyboard,
+            ):
+                return True
+            return await self.edit_message(progress_message, current_text, keyboard)
+
+        initial_text = self.sendable_groups_schedule_progress_text(
+            checked=0,
+            total=len(groups),
+            scheduled_groups=0,
+            skipped=0,
+            failed=0,
+            created_tasks=0,
+            current_group=None,
+            current_action="正在准备检查并创建...",
+        )
+        if not await update_progress_text(initial_text, self.state_cancel_keyboard()) and update.effective_message:
+            progress_message = await update.effective_message.reply_text(
+                initial_text,
+                reply_markup=self.state_cancel_keyboard(),
+            )
+            progress_chat_id = getattr(progress_message, "chat_id", None)
+            progress_message_id = getattr(progress_message, "message_id", None)
+
+        self.db.clear_user_state(user_id)
+        checked = 0
+        scheduled_groups = 0
+        skipped = 0
+        failed = 0
+        created_tasks = 0
+        last_scheduled_at = when
+
+        for group_row in groups:
+            checked += 1
+            current_title = group_row["title"]
+            current_action = "正在检查可发送状态..."
+            try:
+                result = await self.telethon.detect_group_status(session_row, group_row)
+                self.db.update_group(group_row["id"], **result)
+                if result.get("join_status") != "joined" or result.get("speak_status") != "正常可发":
+                    skipped += 1
+                    current_action = f"跳过 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
+                elif interval_minutes is not None:
+                    base_created_tasks = created_tasks
+
+                    async def report_group_progress(created: int, total: int, current_when: datetime) -> None:
+                        nonlocal created_tasks, last_scheduled_at
+                        created_tasks = base_created_tasks + created
+                        last_scheduled_at = current_when
+                        if created not in {1, total} and created % 5 != 0:
+                            return
+                        await update_progress_text(
+                            self.sendable_groups_schedule_progress_text(
+                                checked=checked,
+                                total=len(groups),
+                                scheduled_groups=scheduled_groups,
+                                skipped=skipped,
+                                failed=failed,
+                                created_tasks=created_tasks,
+                                current_group=current_title,
+                                current_action=(
+                                    f"正在创建 {created}/{total} 条 | "
+                                    f"排到 {format_dt(current_when.isoformat(), self.config.default_timezone)}"
+                                ),
+                            ),
+                            self.state_cancel_keyboard(),
+                        )
+
+                    task_ids, _ = await self.create_interval_schedule_batch(
+                        session_row=session_row,
+                        group_row=group_row,
+                        message_text=payload["message_text"],
+                        first_when=when,
+                        interval_minutes=interval_minutes,
+                        repeat_mode=repeat_mode,
+                        progress_callback=report_group_progress,
+                    )
+                    created_tasks = base_created_tasks + len(task_ids)
+                    scheduled_groups += 1
+                    if task_ids:
+                        last_scheduled_at = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
+                    current_action = f"已创建 {len(task_ids)} 条"
+                else:
+                    message_id = await self.telethon.schedule_message(session_row, group_row, payload["message_text"], when)
+                    task_id = self.db.create_task(
+                        session_id=session_row["id"],
+                        group_id=group_row["id"],
+                        message_text=payload["message_text"],
+                        schedule_at=when.isoformat(),
+                        repeat_mode=repeat_mode,
+                        next_run_at=self.telethon.next_daily_run(when).isoformat() if daily_repeat else None,
+                        last_scheduled_for=when.isoformat(),
+                        last_telegram_message_id=message_id,
+                        status="scheduled",
+                    )
+                    created_tasks += 1
+                    scheduled_groups += 1
+                    last_scheduled_at = when
+                    current_action = f"已创建任务 {task_id}"
+            except Exception as exc:
+                message = self.telethon.describe_error(exc)
+                self.db.update_group(group_row["id"], speak_status=message, last_error=message)
+                if message == "账号掉线":
+                    self.db.update_session(session_row["id"], status="offline", last_error=message)
+                failed += 1
+                current_action = f"失败 | {message}"
+
+            if checked in {1, len(groups)} or checked % 2 == 0:
+                await update_progress_text(
+                    self.sendable_groups_schedule_progress_text(
+                        checked=checked,
+                        total=len(groups),
+                        scheduled_groups=scheduled_groups,
+                        skipped=skipped,
+                        failed=failed,
+                        created_tasks=created_tasks,
+                        current_group=current_title,
+                        current_action=current_action,
+                    ),
+                    self.state_cancel_keyboard(),
+                )
+
+        final_lines = [
+            "批量定时创建完成",
+            f"共检查群：{checked}",
+            f"已创建群：{scheduled_groups}",
+            f"跳过：{skipped}",
+            f"失败：{failed}",
+            f"累计任务：{created_tasks}",
+            f"重复：{repeat_text}",
+            f"开始时间：{format_dt(when.isoformat(), self.config.default_timezone)}",
+        ]
+        if interval_minutes is not None and created_tasks > 0:
+            final_lines.append(f"最后一条：{format_dt(last_scheduled_at.isoformat(), self.config.default_timezone)}")
+        final_text = "\n".join(final_lines)
+        keyboard = self.sendable_groups_schedule_done_keyboard(session_row["id"])
+        if not await update_progress_text(final_text, keyboard):
+            await self.render(update, final_text, keyboard)
+
     def join_setup_keyboard(self, payload: dict[str, Any]) -> InlineKeyboardMarkup:
         selected = set(payload.get("session_ids", []))
         distribution = payload.get("distribution", "balanced")
@@ -1188,6 +1376,38 @@ class DsqfBotApp:
         if current_action:
             lines.append(f"状态：{current_action}")
         return "\n".join(lines)
+
+    @staticmethod
+    def sendable_groups_schedule_progress_text(
+        checked: int,
+        total: int,
+        scheduled_groups: int,
+        skipped: int,
+        failed: int,
+        created_tasks: int,
+        current_group: str | None,
+        current_action: str,
+    ) -> str:
+        lines = [
+            f"正在给正常可发群创建定时：{checked}/{total}",
+            f"已创建群：{scheduled_groups}",
+            f"跳过：{skipped}",
+            f"失败：{failed}",
+            f"累计任务：{created_tasks}",
+        ]
+        if current_group:
+            lines.append(f"当前：{current_group}")
+        if current_action:
+            lines.append(f"状态：{current_action}")
+        return "\n".join(lines)
+
+    def sendable_groups_schedule_done_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("查看任务", callback_data="tasks")],
+                [InlineKeyboardButton("返回群列表", callback_data=f"account:groups:{session_id}")],
+            ]
+        )
 
     def join_jobs_text(self) -> str:
         jobs = self.db.list_join_jobs()
