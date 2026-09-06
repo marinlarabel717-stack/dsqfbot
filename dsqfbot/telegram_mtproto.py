@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import random
 import re
+import string
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -81,6 +82,7 @@ class TelethonManager:
                 "label": label or session_file,
                 "phone": f"+{phone}" if phone else "-",
                 "is_premium": bool(getattr(me, "premium", False)),
+                "username": getattr(me, "username", None),
             }
         finally:
             await client.disconnect()
@@ -116,16 +118,28 @@ class TelethonManager:
         finally:
             await client.disconnect()
 
-    async def verify_session(self, session_row: dict[str, Any]) -> dict[str, Any]:
+    async def verify_session(self, session_row: dict[str, Any], auto_set_username: bool = False) -> dict[str, Any]:
         client = self.build_client(session_row["session_file"])
         await client.connect()
         try:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             me = await client.get_me()
+            username = getattr(me, "username", None)
+            username_set = False
+            username_error = None
+            if auto_set_username and not username:
+                username, username_set, username_error = await self._ensure_random_username(
+                    client,
+                    me,
+                    session_row.get("label"),
+                )
             return {
                 "label": " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip() or session_row["label"],
                 "is_premium": bool(getattr(me, "premium", False)),
+                "username": username,
+                "username_set": username_set,
+                "username_error": username_error,
             }
         finally:
             await client.disconnect()
@@ -397,6 +411,40 @@ class TelethonManager:
             return False, f"关联频道需审批：{title}"
         except Exception as exc:
             return False, f"关注关联频道失败：{self.describe_error(exc)}"
+
+    async def _ensure_random_username(self, client: TelegramClient, me: Any, label: str | None) -> tuple[str | None, bool, str | None]:
+        current_username = getattr(me, "username", None)
+        if current_username:
+            return current_username, False, None
+        base = self._username_base(label, getattr(me, "first_name", None), getattr(me, "last_name", None))
+        for _ in range(12):
+            candidate = self._random_username_candidate(base)
+            try:
+                user = await client(functions.account.UpdateUsernameRequest(candidate))
+                return getattr(user, "username", None) or candidate, True, None
+            except (errors.UsernameOccupiedError, errors.UsernameInvalidError):
+                continue
+            except Exception as exc:
+                return None, False, self.describe_error(exc)
+        return None, False, "随机用户名生成失败"
+
+    @staticmethod
+    def _username_base(*parts: str | None) -> str:
+        merged = "".join(part or "" for part in parts).lower()
+        merged = re.sub(r"[^a-z0-9]", "", merged)
+        merged = re.sub(r"^\d+", "", merged)
+        if not merged:
+            merged = "u"
+        return merged[:10]
+
+    @staticmethod
+    def _random_username_candidate(base: str) -> str:
+        letters = string.ascii_lowercase + string.digits
+        suffix = "".join(random.choice(letters) for _ in range(8))
+        candidate = f"{base}{suffix}"
+        if len(candidate) < 5:
+            candidate = candidate + "".join(random.choice(letters) for _ in range(5 - len(candidate)))
+        return candidate[:32]
 
     def next_daily_run(self, when: datetime) -> datetime:
         return when + timedelta(days=1)

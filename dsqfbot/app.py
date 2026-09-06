@@ -201,7 +201,7 @@ class DsqfBotApp:
             await self.render(update, "账号已登录，但本地保存失败。")
             return
         try:
-            info = await self.telethon.verify_session(session_row)
+            info = await self.telethon.verify_session(session_row, auto_set_username=True)
             self.db.update_session(
                 session_id,
                 status="online",
@@ -209,9 +209,14 @@ class DsqfBotApp:
                 label=payload["label"],
                 last_error="",
             )
+            extra = ""
+            if info.get("username_set") and info.get("username"):
+                extra = f"\n已自动生成用户名：@{info['username']}"
+            elif info.get("username_error"):
+                extra = f"\n未能自动生成用户名：{info['username_error']}"
             await self.render(
                 update,
-                f"账号添加成功：{payload['label']}，Premium：{'是' if info['is_premium'] else '否'}",
+                f"账号添加成功：{payload['label']}，Premium：{'是' if info['is_premium'] else '否'}{extra}",
                 self.account_detail_keyboard(session_id),
             )
         except Exception as exc:
@@ -282,12 +287,17 @@ class DsqfBotApp:
                         is_premium=info["is_premium"],
                         status="online",
                     )
+                    session_row = self.db.get_session(session_id)
+                    verify_info = await self.telethon.verify_session(session_row, auto_set_username=True) if session_row else None
                     imported.append(
                         {
                             "id": session_id,
                             "label": label,
                             "phone": info["phone"],
                             "is_premium": info["is_premium"],
+                            "username": (verify_info or info).get("username"),
+                            "username_set": bool(verify_info and verify_info.get("username_set")),
+                            "username_error": verify_info.get("username_error") if verify_info else None,
                         }
                     )
                 except Exception as exc:
@@ -583,7 +593,14 @@ class DsqfBotApp:
         self.db.clear_user_state(user_id)
         lines = [f"导入完成：成功 {len(imported)} 个，失败 {len(failed)} 个"]
         for item in imported[:10]:
-            lines.append(f"成功：{item['label']} | {item['phone']} | {'Premium' if item['is_premium'] else '普通'}")
+            extra = ""
+            if item.get("username_set") and item.get("username"):
+                extra = f" | 已生成 @{item['username']}"
+            elif item.get("username"):
+                extra = f" | @{item['username']}"
+            elif item.get("username_error"):
+                extra = f" | 用户名失败：{item['username_error']}"
+            lines.append(f"成功：{item['label']} | {item['phone']} | {'Premium' if item['is_premium'] else '普通'}{extra}")
         for item in failed[:10]:
             lines.append(f"失败：{item}")
         await self.render(update, "\n".join(lines), self.accounts_keyboard())
@@ -626,9 +643,14 @@ class DsqfBotApp:
                     await self.render(update, "账号不存在。")
                     return
                 try:
-                    info = await self.telethon.verify_session(session_row)
+                    info = await self.telethon.verify_session(session_row, auto_set_username=True)
                     self.db.update_session(session_id, status="online", is_premium=int(info["is_premium"]), label=info["label"], last_error="")
-                    await self.render(update, "账号状态已刷新。", self.account_detail_keyboard(session_id))
+                    note = "账号状态已刷新。"
+                    if info.get("username_set") and info.get("username"):
+                        note += f"\n已自动生成用户名：@{info['username']}"
+                    elif info.get("username_error"):
+                        note += f"\n未能自动生成用户名：{info['username_error']}"
+                    await self.render(update, note, self.account_detail_keyboard(session_id))
                 except Exception as exc:
                     self.db.update_session(session_id, status="offline", last_error=self.telethon.describe_error(exc))
                     await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
