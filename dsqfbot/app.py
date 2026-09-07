@@ -23,6 +23,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 LOGGER = logging.getLogger("dsqfbot")
 TELEGRAM_SCHEDULE_LIMIT = 100
 TASKS_PAGE_SIZE = 10
+GROUPS_PAGE_SIZE = 20
 
 
 class DsqfBotApp:
@@ -700,8 +701,10 @@ class DsqfBotApp:
                 await self.render(update, f"账号已删除：{session_row['label']}", self.accounts_keyboard())
                 return
             if data.startswith("account:groups:"):
-                session_id = int(data.split(":")[-1])
-                await self.render(update, self.groups_text(session_id), self.groups_keyboard(session_id))
+                parts = data.split(":")
+                session_id = int(parts[2])
+                page = int(parts[3]) if len(parts) > 3 else 0
+                await self.render(update, self.groups_text(session_id, page), self.groups_keyboard(session_id, page))
                 return
             if data.startswith("groups:schedule_sendable:"):
                 session_id = int(data.split(":")[-1])
@@ -791,11 +794,15 @@ class DsqfBotApp:
                     await self.render(update, final_text, self.groups_keyboard(session_id))
                 return
             if data.startswith("group:view:"):
-                group_id = int(data.split(":")[-1])
-                await self.render(update, self.group_detail_text(group_id), self.group_detail_keyboard(group_id))
+                parts = data.split(":")
+                group_id = int(parts[2])
+                return_page = int(parts[3]) if len(parts) > 3 else 0
+                await self.render(update, self.group_detail_text(group_id), self.group_detail_keyboard(group_id, return_page))
                 return
             if data.startswith("group:scheduled:"):
-                group_id = int(data.split(":")[-1])
+                parts = data.split(":")
+                group_id = int(parts[2])
+                return_page = int(parts[3]) if len(parts) > 3 else 0
                 group_row = self.db.get_group(group_id)
                 if not group_row:
                     await self.render(update, "群不存在。")
@@ -806,12 +813,14 @@ class DsqfBotApp:
                     return
                 try:
                     messages = await self.telethon.list_scheduled_messages(session_row, group_row)
-                    await self.render(update, self.scheduled_messages_text(group_row, messages), self.scheduled_messages_keyboard(group_id))
+                    await self.render(update, self.scheduled_messages_text(group_row, messages), self.scheduled_messages_keyboard(group_id, return_page))
                 except Exception as exc:
-                    await self.render(update, f"读取失败：{self.telethon.describe_error(exc)}", self.group_detail_keyboard(group_id))
+                    await self.render(update, f"读取失败：{self.telethon.describe_error(exc)}", self.group_detail_keyboard(group_id, return_page))
                 return
             if data.startswith("group:refresh:"):
-                group_id = int(data.split(":")[-1])
+                parts = data.split(":")
+                group_id = int(parts[2])
+                return_page = int(parts[3]) if len(parts) > 3 else 0
                 group_row = self.db.get_group(group_id)
                 if not group_row:
                     await self.render(update, "群不存在。")
@@ -822,7 +831,7 @@ class DsqfBotApp:
                     return
                 result = await self.telethon.detect_group_status(session_row, group_row)
                 self.db.update_group(group_id, **result)
-                await self.render(update, self.group_detail_text(group_id), self.group_detail_keyboard(group_id))
+                await self.render(update, self.group_detail_text(group_id), self.group_detail_keyboard(group_id, return_page))
                 return
             if data.startswith("group:schedule:"):
                 group_id = int(data.split(":")[-1])
@@ -993,19 +1002,27 @@ class DsqfBotApp:
             ]
         )
 
-    def groups_text(self, session_id: int) -> str:
-        groups = self.visible_groups(session_id)
+    def groups_text(self, session_id: int, page: int = 0) -> str:
+        groups, total, current_page = self.group_page_items(session_id, page)
         if not groups:
             return "这个账号当前没有显示中的在群群组。"
-        lines = ["群组列表（最近 20 个）"]
-        for item in groups[:20]:
+        total_pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+        lines = [f"群组列表（第 {current_page + 1}/{total_pages} 页，共 {total} 个）"]
+        for item in groups:
             group_link = item["link"] or (f"https://t.me/{item['username']}" if item.get("username") else "-")
             lines.append(f"{item['id']}. {item['title']} | {group_link} | {self.human_join_status(item['join_status'])} | {item['speak_status']}")
         return "\n".join(lines)
 
-    def groups_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
-        groups = self.visible_groups(session_id)[:20]
-        rows = [[InlineKeyboardButton(item["title"][:40], callback_data=f"group:view:{item['id']}")] for item in groups]
+    def groups_keyboard(self, session_id: int, page: int = 0) -> InlineKeyboardMarkup:
+        groups, total, current_page = self.group_page_items(session_id, page)
+        rows = [[InlineKeyboardButton(item["title"][:40], callback_data=f"group:view:{item['id']}:{current_page}")] for item in groups]
+        nav_row: list[InlineKeyboardButton] = []
+        if current_page > 0:
+            nav_row.append(InlineKeyboardButton("上一页", callback_data=f"account:groups:{session_id}:{current_page - 1}"))
+        if (current_page + 1) * GROUPS_PAGE_SIZE < total:
+            nav_row.append(InlineKeyboardButton("下一页", callback_data=f"account:groups:{session_id}:{current_page + 1}"))
+        if nav_row:
+            rows.append(nav_row)
         rows.append([InlineKeyboardButton("一键给正常可发群建定时", callback_data=f"groups:schedule_sendable:{session_id}")])
         rows.append([InlineKeyboardButton("一键退出无法发送的群", callback_data=f"groups:leave_unsendable:{session_id}")])
         rows.append([InlineKeyboardButton("返回账号详情", callback_data=f"account:view:{session_id}")])
@@ -1013,6 +1030,17 @@ class DsqfBotApp:
 
     def visible_groups(self, session_id: int) -> list[dict[str, Any]]:
         return [item for item in self.db.list_groups(session_id) if item.get("join_status") != "left" and not int(item.get("is_channel") or 0)]
+
+    def group_page_items(self, session_id: int, page: int = 0) -> tuple[list[dict[str, Any]], int, int]:
+        groups = self.visible_groups(session_id)
+        total = len(groups)
+        if total <= 0:
+            return [], 0, 0
+        max_page = max(0, (total - 1) // GROUPS_PAGE_SIZE)
+        current_page = max(0, min(page, max_page))
+        start = current_page * GROUPS_PAGE_SIZE
+        end = start + GROUPS_PAGE_SIZE
+        return groups[start:end], total, current_page
 
     def group_detail_text(self, group_id: int) -> str:
         group = self.db.get_group(group_id)
@@ -1028,17 +1056,17 @@ class DsqfBotApp:
             f"错误：{group['last_error'] or '-'}"
         )
 
-    def group_detail_keyboard(self, group_id: int) -> InlineKeyboardMarkup:
+    def group_detail_keyboard(self, group_id: int, return_page: int = 0) -> InlineKeyboardMarkup:
         group = self.db.get_group(group_id)
         session_id = group["session_id"] if group else 0
         return InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("刷新状态", callback_data=f"group:refresh:{group_id}"),
+                    InlineKeyboardButton("刷新状态", callback_data=f"group:refresh:{group_id}:{return_page}"),
                     InlineKeyboardButton("新建定时消息", callback_data=f"group:schedule:{group_id}"),
                 ],
-                [InlineKeyboardButton("查看已设定时", callback_data=f"group:scheduled:{group_id}")],
-                [InlineKeyboardButton("返回群列表", callback_data=f"account:groups:{session_id}")],
+                [InlineKeyboardButton("查看已设定时", callback_data=f"group:scheduled:{group_id}:{return_page}")],
+                [InlineKeyboardButton("返回群列表", callback_data=f"account:groups:{session_id}:{return_page}")],
             ]
         )
 
@@ -1602,11 +1630,11 @@ class DsqfBotApp:
             lines.append(f"{item['message_id']}. {format_dt(item['schedule_at'], self.config.default_timezone)}{repeat_label} | {preview or '[空消息]'}")
         return "\n".join(lines)
 
-    def scheduled_messages_keyboard(self, group_id: int) -> InlineKeyboardMarkup:
+    def scheduled_messages_keyboard(self, group_id: int, return_page: int = 0) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("刷新已设定时", callback_data=f"group:scheduled:{group_id}")],
-                [InlineKeyboardButton("返回群详情", callback_data=f"group:view:{group_id}")],
+                [InlineKeyboardButton("刷新已设定时", callback_data=f"group:scheduled:{group_id}:{return_page}")],
+                [InlineKeyboardButton("返回群详情", callback_data=f"group:view:{group_id}:{return_page}")],
             ]
         )
 

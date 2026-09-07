@@ -391,9 +391,8 @@ class TelethonManager:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
-            dialogs = await client.get_dialogs(limit=200)
             items: list[dict[str, Any]] = []
-            for dialog in dialogs:
+            async for dialog in client.iter_dialogs():
                 if not (dialog.is_group or dialog.is_channel):
                     continue
                 entity = dialog.entity
