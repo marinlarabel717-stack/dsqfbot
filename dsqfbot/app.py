@@ -674,9 +674,17 @@ class DsqfBotApp:
                 try:
                     items = await self.telethon.list_groups(session_row)
                     for item in items:
-                        self.db.upsert_group(session_id, item["peer_id"], item["title"], item["username"], item["link"])
+                        self.db.upsert_group(
+                            session_id,
+                            item["peer_id"],
+                            item["title"],
+                            item["username"],
+                            item["link"],
+                            is_channel=bool(item.get("is_channel")),
+                        )
                     self.db.update_session(session_id, status="online", last_error="")
-                    await self.render(update, f"同步完成，共 {len(items)} 个群/频道。", self.account_detail_keyboard(session_id))
+                    group_count = sum(1 for item in items if not item.get("is_channel"))
+                    await self.render(update, f"同步完成，共 {group_count} 个群。频道已自动隐藏。", self.account_detail_keyboard(session_id))
                 except Exception as exc:
                     self.db.update_session(session_id, status="offline", last_error=self.telethon.describe_error(exc))
                     await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
@@ -1004,7 +1012,7 @@ class DsqfBotApp:
         return InlineKeyboardMarkup(rows)
 
     def visible_groups(self, session_id: int) -> list[dict[str, Any]]:
-        return [item for item in self.db.list_groups(session_id) if item.get("join_status") != "left"]
+        return [item for item in self.db.list_groups(session_id) if item.get("join_status") != "left" and not int(item.get("is_channel") or 0)]
 
     def group_detail_text(self, group_id: int) -> str:
         group = self.db.get_group(group_id)

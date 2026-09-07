@@ -397,12 +397,14 @@ class TelethonManager:
                 if not (dialog.is_group or dialog.is_channel):
                     continue
                 entity = dialog.entity
+                is_channel = bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False))
                 items.append(
                     {
                         "peer_id": int(getattr(entity, "id")),
                         "title": getattr(entity, "title", "") or getattr(entity, "first_name", "") or str(getattr(entity, "id")),
                         "username": getattr(entity, "username", None),
                         "link": f"https://t.me/{entity.username}" if getattr(entity, "username", None) else None,
+                        "is_channel": is_channel,
                     }
                 )
             return items

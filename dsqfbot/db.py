@@ -60,6 +60,7 @@ class Database:
                     title TEXT NOT NULL,
                     username TEXT,
                     link TEXT,
+                    is_channel INTEGER NOT NULL DEFAULT 0,
                     join_status TEXT NOT NULL DEFAULT 'joined',
                     speak_status TEXT NOT NULL DEFAULT 'unknown',
                     last_error TEXT,
@@ -119,6 +120,7 @@ class Database:
                 """
             )
             self._ensure_column(conn, "join_jobs", "batch_id", "INTEGER")
+            self._ensure_column(conn, "groups", "is_channel", "INTEGER NOT NULL DEFAULT 0")
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, column_sql: str) -> None:
@@ -205,6 +207,7 @@ class Database:
         title: str,
         username: str | None,
         link: str | None,
+        is_channel: bool = False,
         join_status: str = "joined",
         speak_status: str = "unknown",
         last_error: str | None = None,
@@ -219,19 +222,19 @@ class Database:
                 conn.execute(
                     """
                     UPDATE groups
-                    SET title=?, username=?, link=?, join_status=?, speak_status=?, last_error=?, last_checked_at=?, updated_at=?
+                    SET title=?, username=?, link=?, is_channel=?, join_status=?, speak_status=?, last_error=?, last_checked_at=?, updated_at=?
                     WHERE id=?
                     """,
-                    (title, username, link, join_status, speak_status, last_error, now, now, row["id"]),
+                    (title, username, link, int(is_channel), join_status, speak_status, last_error, now, now, row["id"]),
                 )
                 return int(row["id"])
             cur = conn.execute(
                 """
                 INSERT INTO groups (
-                    session_id, peer_id, title, username, link, join_status, speak_status, last_error, last_checked_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    session_id, peer_id, title, username, link, is_channel, join_status, speak_status, last_error, last_checked_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, peer_id, title, username, link, join_status, speak_status, last_error, now, now, now),
+                (session_id, peer_id, title, username, link, int(is_channel), join_status, speak_status, last_error, now, now, now),
             )
             return int(cur.lastrowid)
 
