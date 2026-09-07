@@ -452,7 +452,7 @@ class TelethonManager:
                     if not (dialog.is_group or dialog.is_channel):
                         continue
                     username = getattr(entity, "username", None)
-                    is_channel = bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False))
+                    is_channel = not bool(getattr(dialog, "is_group", False))
                     items.append(
                         {
                             "peer_id": peer_id,
@@ -505,6 +505,7 @@ class TelethonManager:
                         "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
                         "username": getattr(entity, "username", None),
                         "link": link,
+                        "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
                         "join_status": "joined",
                     }
                 except errors.InviteRequestSentError:
@@ -524,6 +525,7 @@ class TelethonManager:
                         "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
                         "username": getattr(entity, "username", None),
                         "link": link,
+                        "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
                         "join_status": "joined",
                     }
             if public_match:
@@ -538,6 +540,7 @@ class TelethonManager:
                     "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
                     "username": getattr(entity, "username", None),
                     "link": f"https://t.me/{username}",
+                    "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
                     "join_status": "joined",
                 }
             if link.startswith("@"):
@@ -551,6 +554,7 @@ class TelethonManager:
                     "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
                     "username": getattr(entity, "username", None),
                     "link": link,
+                    "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
                     "join_status": "joined",
                 }
             raise RuntimeError("无法识别群链接")

@@ -1060,9 +1060,10 @@ class DsqfBotApp:
             return "这个账号当前没有显示中的在群群组。"
         total_pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
         lines = [f"群组列表（第 {current_page + 1}/{total_pages} 页，共 {total} 个）"]
-        for item in groups:
+        start_index = current_page * GROUPS_PAGE_SIZE
+        for index, item in enumerate(groups, start=start_index + 1):
             group_link = item["link"] or (f"https://t.me/{item['username']}" if item.get("username") else "-")
-            lines.append(f"{item['id']}. {item['title']} | {group_link} | {self.human_join_status(item['join_status'])} | {item['speak_status']}")
+            lines.append(f"{index}. {item['title']} | {group_link} | {self.human_join_status(item['join_status'])} | {item['speak_status']}")
         return "\n".join(lines)
 
     def groups_keyboard(self, session_id: int, page: int = 0) -> InlineKeyboardMarkup:
@@ -1081,7 +1082,13 @@ class DsqfBotApp:
         return InlineKeyboardMarkup(rows)
 
     def visible_groups(self, session_id: int) -> list[dict[str, Any]]:
-        return [item for item in self.db.list_groups(session_id) if item.get("join_status") != "left" and not int(item.get("is_channel") or 0)]
+        groups = [
+            item
+            for item in self.db.list_groups(session_id)
+            if item.get("join_status") != "left" and not int(item.get("is_channel") or 0)
+        ]
+        groups.sort(key=lambda item: int(item.get("id") or 0))
+        return groups
 
     def group_page_items(self, session_id: int, page: int = 0) -> tuple[list[dict[str, Any]], int, int]:
         groups = self.visible_groups(session_id)
@@ -1789,6 +1796,7 @@ class DsqfBotApp:
                         title=result["title"],
                         username=result.get("username"),
                         link=result.get("link"),
+                        is_channel=bool(result.get("is_channel")),
                         join_status=result.get("join_status", "joined"),
                     )
                 self.db.finish_join_job(job["id"], result.get("join_status", "joined"), group_id=group_id)
