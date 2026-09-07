@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import random
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, errors, functions
+from telethon.errors.common import TypeNotFoundError
 from telethon.tl import alltlobjects, patched as patched_types, types
 from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import (
@@ -33,6 +35,7 @@ PUBLIC_RE = re.compile(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})/?$", re.IGNORECA
 TELEGRAM_DAILY_REPEAT_PERIOD = 24 * 60 * 60
 CURRENT_MESSAGE_CONSTRUCTOR_ID = 0x3AE56482
 CURRENT_REPEAT_SEND_MESSAGE_CONSTRUCTOR_ID = 0x545CD15A
+LOGGER = logging.getLogger("dsqfbot.telethon")
 
 
 class SendMessageWithRepeatRequest(TLRequest):
@@ -391,22 +394,73 @@ class TelethonManager:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
-            items: list[dict[str, Any]] = []
-            async for dialog in client.iter_dialogs():
+            return await self._list_groups_resilient(client)
+
+    async def _list_groups_resilient(self, client: TelegramClient) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        seen_peer_ids: set[int] = set()
+        offset_date: datetime | None = None
+        offset_id = 0
+        offset_peer: Any = types.InputPeerEmpty()
+        ignore_pinned = False
+        batch_size = 50
+
+        while True:
+            try:
+                dialogs = [
+                    dialog
+                    async for dialog in client.iter_dialogs(
+                        limit=batch_size,
+                        offset_date=offset_date,
+                        offset_id=offset_id,
+                        offset_peer=offset_peer,
+                        ignore_pinned=ignore_pinned,
+                        ignore_migrated=True,
+                        folder=0,
+                    )
+                ]
+            except TypeNotFoundError as exc:
+                if batch_size > 1:
+                    batch_size = max(1, batch_size // 2)
+                    LOGGER.warning("dialog batch parse failed, retrying with smaller batch size=%s: %s", batch_size, exc)
+                    continue
+                if items:
+                    LOGGER.warning("dialog parse failed after partial sync, returning collected groups: %s", exc)
+                    return items
+                raise RuntimeError("同步群组时遇到 Telegram 异常对话，请稍后重试")
+
+            if not dialogs:
+                return items
+
+            ignore_pinned = True
+            for dialog in dialogs:
+                entity = dialog.entity
+                peer_id = int(getattr(entity, "id", 0) or 0)
+                if peer_id <= 0 or peer_id in seen_peer_ids:
+                    continue
+                seen_peer_ids.add(peer_id)
                 if not (dialog.is_group or dialog.is_channel):
                     continue
-                entity = dialog.entity
                 is_channel = bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False))
                 items.append(
                     {
-                        "peer_id": int(getattr(entity, "id")),
-                        "title": getattr(entity, "title", "") or getattr(entity, "first_name", "") or str(getattr(entity, "id")),
+                        "peer_id": peer_id,
+                        "title": getattr(entity, "title", "") or getattr(entity, "first_name", "") or str(peer_id),
                         "username": getattr(entity, "username", None),
                         "link": f"https://t.me/{entity.username}" if getattr(entity, "username", None) else None,
                         "is_channel": is_channel,
                     }
                 )
-            return items
+
+            last_dialog = dialogs[-1]
+            last_offset_id = last_dialog.message.id if last_dialog.message else 0
+            if last_dialog.input_entity == offset_peer and last_offset_id == offset_id:
+                return items
+            offset_peer = last_dialog.input_entity
+            offset_id = last_offset_id
+            offset_date = last_dialog.date
+            if len(dialogs) < batch_size:
+                return items
 
     async def join_link(self, session_row: dict[str, Any], link: str) -> dict[str, Any]:
         link = normalize_link(link)
