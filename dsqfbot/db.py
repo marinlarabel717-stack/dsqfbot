@@ -485,6 +485,11 @@ class Database:
         with self.connect() as conn:
             conn.execute(f"UPDATE tasks SET {keys} WHERE id = ?", (*fields.values(), task_id))
 
+    def delete_tasks_by_group(self, group_id: int) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM tasks WHERE group_id = ?", (group_id,))
+            return int(cur.rowcount or 0)
+
     def delete_completed_once_tasks(self, cutoff_iso: str) -> int:
         with self.connect() as conn:
             cur = conn.execute(

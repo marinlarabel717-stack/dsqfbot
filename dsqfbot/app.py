@@ -817,6 +817,35 @@ class DsqfBotApp:
                 except Exception as exc:
                     await self.render(update, f"读取失败：{self.telethon.describe_error(exc)}", self.group_detail_keyboard(group_id, return_page))
                 return
+            if data.startswith("group:scheduled_delete_all:"):
+                parts = data.split(":")
+                group_id = int(parts[2])
+                return_page = int(parts[3]) if len(parts) > 3 else 0
+                group_row = self.db.get_group(group_id)
+                if not group_row:
+                    await self.render(update, "群不存在。")
+                    return
+                session_row = self.db.get_session(group_row["session_id"])
+                if not session_row:
+                    await self.render(update, "账号不存在。")
+                    return
+                try:
+                    deleted_count, local_deleted = await self.delete_group_scheduled_messages(group_row, session_row)
+                    if deleted_count <= 0 and local_deleted <= 0:
+                        await self.render(update, "这个群当前没有可删除的定时消息。", self.group_detail_keyboard(group_id, return_page))
+                        return
+                    await self.render(
+                        update,
+                        (
+                            f"已清空 {group_row['title']} 的定时消息。\n"
+                            f"Telegram 已删除：{deleted_count} 条\n"
+                            f"本地任务已删除：{local_deleted} 条"
+                        ),
+                        self.group_detail_keyboard(group_id, return_page),
+                    )
+                except Exception as exc:
+                    await self.render(update, f"删除失败：{self.telethon.describe_error(exc)}", self.group_detail_keyboard(group_id, return_page))
+                return
             if data.startswith("group:refresh:"):
                 parts = data.split(":")
                 group_id = int(parts[2])
@@ -1065,7 +1094,10 @@ class DsqfBotApp:
                     InlineKeyboardButton("刷新状态", callback_data=f"group:refresh:{group_id}:{return_page}"),
                     InlineKeyboardButton("新建定时消息", callback_data=f"group:schedule:{group_id}"),
                 ],
-                [InlineKeyboardButton("查看已设定时", callback_data=f"group:scheduled:{group_id}:{return_page}")],
+                [
+                    InlineKeyboardButton("查看已设定时", callback_data=f"group:scheduled:{group_id}:{return_page}"),
+                    InlineKeyboardButton("一键删除定时", callback_data=f"group:scheduled_delete_all:{group_id}:{return_page}"),
+                ],
                 [InlineKeyboardButton("返回群列表", callback_data=f"account:groups:{session_id}:{return_page}")],
             ]
         )
@@ -1633,10 +1665,24 @@ class DsqfBotApp:
     def scheduled_messages_keyboard(self, group_id: int, return_page: int = 0) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
             [
+                [InlineKeyboardButton("一键删除本群定时", callback_data=f"group:scheduled_delete_all:{group_id}:{return_page}")],
                 [InlineKeyboardButton("刷新已设定时", callback_data=f"group:scheduled:{group_id}:{return_page}")],
                 [InlineKeyboardButton("返回群详情", callback_data=f"group:view:{group_id}:{return_page}")],
             ]
         )
+
+    async def delete_group_scheduled_messages(
+        self,
+        group_row: dict[str, Any],
+        session_row: dict[str, Any],
+    ) -> tuple[int, int]:
+        messages = await self.telethon.list_scheduled_messages(session_row, group_row)
+        message_ids = [int(item["message_id"]) for item in messages if int(item.get("message_id") or 0) > 0]
+        deleted_count = 0
+        if message_ids:
+            deleted_count = await self.telethon.delete_scheduled_messages(session_row, group_row, message_ids)
+        local_deleted = self.db.delete_tasks_by_group(int(group_row["id"]))
+        return deleted_count, local_deleted
 
     @staticmethod
     def human_session_status(status: str) -> str:

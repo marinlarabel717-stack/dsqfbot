@@ -531,6 +531,15 @@ class TelethonManager:
             entity = await self._resolve_entity(client, group_row)
             await client(DeleteScheduledMessagesRequest(peer=entity, id=[message_id]))
 
+    async def delete_scheduled_messages(self, session_row: dict[str, Any], group_row: dict[str, Any], message_ids: list[int]) -> int:
+        ids = [int(item) for item in message_ids if int(item) > 0]
+        if not ids:
+            return 0
+        async with self.locked_client(session_row["session_file"]) as client:
+            entity = await self._resolve_entity(client, group_row)
+            await client(DeleteScheduledMessagesRequest(peer=entity, id=ids))
+        return len(ids)
+
     async def detect_group_status(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> dict[str, str]:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
