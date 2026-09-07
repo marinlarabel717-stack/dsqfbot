@@ -24,6 +24,7 @@ LOGGER = logging.getLogger("dsqfbot")
 TELEGRAM_SCHEDULE_LIMIT = 100
 TASKS_PAGE_SIZE = 10
 GROUPS_PAGE_SIZE = 20
+TELEGRAM_TEXT_LIMIT = 4000
 
 
 class DsqfBotApp:
@@ -59,27 +60,29 @@ class DsqfBotApp:
         await self.render_message(update, text, keyboard)
 
     async def render_message(self, update: Update, text: str, keyboard: InlineKeyboardMarkup | None = None) -> Any:
+        safe_text = self.fit_telegram_text(text)
         if update.callback_query:
             await update.callback_query.answer()
             message = update.callback_query.message
             if message:
                 try:
-                    await message.edit_text(text, reply_markup=keyboard)
+                    await message.edit_text(safe_text, reply_markup=keyboard)
                     return message
                 except BadRequest as exc:
                     if "Message is not modified" in str(exc):
                         return message
                     LOGGER.warning("edit callback message failed: %s", exc)
-                    return await message.reply_text(text, reply_markup=keyboard)
+                    return await message.reply_text(safe_text, reply_markup=keyboard)
         elif update.effective_message:
-            return await update.effective_message.reply_text(text, reply_markup=keyboard)
+            return await update.effective_message.reply_text(safe_text, reply_markup=keyboard)
         return None
 
     async def edit_message(self, message: Any, text: str, keyboard: InlineKeyboardMarkup | None = None) -> bool:
         if not message:
             return False
+        safe_text = self.fit_telegram_text(text)
         try:
-            await message.edit_text(text, reply_markup=keyboard)
+            await message.edit_text(safe_text, reply_markup=keyboard)
             return True
         except BadRequest as exc:
             if "Message is not modified" in str(exc):
@@ -99,11 +102,12 @@ class DsqfBotApp:
     ) -> bool:
         if not chat_id or not message_id:
             return False
+        safe_text = self.fit_telegram_text(text)
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=text,
+                text=safe_text,
                 reply_markup=keyboard,
             )
             return True
@@ -124,11 +128,12 @@ class DsqfBotApp:
     ) -> bool:
         if not self.application or not chat_id or not message_id:
             return False
+        safe_text = self.fit_telegram_text(text)
         try:
             await self.application.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=text,
+                text=safe_text,
                 reply_markup=keyboard,
             )
             return True
@@ -139,6 +144,16 @@ class DsqfBotApp:
         except Exception as exc:
             LOGGER.warning("edit message by bot failed: %s", exc)
         return False
+
+    @staticmethod
+    def fit_telegram_text(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> str:
+        value = text or ""
+        if len(value) <= limit:
+            return value
+        suffix = "\n\n[内容过长，已自动截断]"
+        if len(suffix) >= limit:
+            return suffix[:limit]
+        return value[: limit - len(suffix)] + suffix
 
     async def refresh_join_batch_message(self, batch_id: int, final: bool = False) -> None:
         batch = self.db.get_join_batch(batch_id)
