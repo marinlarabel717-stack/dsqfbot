@@ -434,31 +434,44 @@ class TelethonManager:
 
             ignore_pinned = True
             for dialog in dialogs:
-                entity = dialog.entity
-                peer_id = int(getattr(entity, "id", 0) or 0)
-                if peer_id <= 0 or peer_id in seen_peer_ids:
+                try:
+                    entity = dialog.entity
+                    if not isinstance(entity, (types.Chat, types.ChatForbidden, types.Channel)):
+                        continue
+                    peer_id = int(getattr(entity, "id", 0) or 0)
+                    if peer_id <= 0 or peer_id in seen_peer_ids:
+                        continue
+                    seen_peer_ids.add(peer_id)
+                    if not (dialog.is_group or dialog.is_channel):
+                        continue
+                    username = getattr(entity, "username", None)
+                    is_channel = bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False))
+                    items.append(
+                        {
+                            "peer_id": peer_id,
+                            "title": getattr(entity, "title", "") or getattr(entity, "first_name", "") or str(peer_id),
+                            "username": username,
+                            "link": f"https://t.me/{username}" if username else None,
+                            "is_channel": is_channel,
+                        }
+                    )
+                except Exception as exc:
+                    LOGGER.warning("skip malformed dialog during sync: %s", exc)
                     continue
-                seen_peer_ids.add(peer_id)
-                if not (dialog.is_group or dialog.is_channel):
-                    continue
-                is_channel = bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False))
-                items.append(
-                    {
-                        "peer_id": peer_id,
-                        "title": getattr(entity, "title", "") or getattr(entity, "first_name", "") or str(peer_id),
-                        "username": getattr(entity, "username", None),
-                        "link": f"https://t.me/{entity.username}" if getattr(entity, "username", None) else None,
-                        "is_channel": is_channel,
-                    }
-                )
 
             last_dialog = dialogs[-1]
-            last_offset_id = last_dialog.message.id if last_dialog.message else 0
-            if last_dialog.input_entity == offset_peer and last_offset_id == offset_id:
+            try:
+                last_offset_id = last_dialog.message.id if last_dialog.message else 0
+                next_offset_peer = last_dialog.input_entity
+                next_offset_date = last_dialog.date
+            except Exception as exc:
+                LOGGER.warning("stop dialog sync pagination due to malformed offset dialog: %s", exc)
                 return items
-            offset_peer = last_dialog.input_entity
+            if next_offset_peer == offset_peer and last_offset_id == offset_id:
+                return items
+            offset_peer = next_offset_peer
             offset_id = last_offset_id
-            offset_date = last_dialog.date
+            offset_date = next_offset_date
             if len(dialogs) < batch_size:
                 return items
 
