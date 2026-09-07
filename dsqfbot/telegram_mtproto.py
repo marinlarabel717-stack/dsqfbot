@@ -276,6 +276,9 @@ class LoginResult:
     need_password: bool
     label: str | None = None
     is_premium: bool = False
+    username: str | None = None
+    username_set: bool = False
+    username_error: str | None = None
 
 
 class TelethonManager:
@@ -398,18 +401,29 @@ class TelethonManager:
         self,
         session_file: str,
         phone: str,
-        code: str,
-        phone_code_hash: str,
+        code: str | None,
+        phone_code_hash: str | None,
         password: str | None = None,
     ) -> LoginResult:
         async with self.locked_client(session_file) as client:
             try:
-                await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash, password=password)
+                if password:
+                    await client.sign_in(password=password)
+                else:
+                    await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
             except errors.SessionPasswordNeededError:
                 return LoginResult(need_password=True)
             me = await client.get_me()
             label = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip()
-            return LoginResult(need_password=False, label=label or phone, is_premium=bool(getattr(me, "premium", False)))
+            username, username_set, username_error = await self._ensure_random_username(client, me, label or phone)
+            return LoginResult(
+                need_password=False,
+                label=label or phone,
+                is_premium=bool(getattr(me, "premium", False)),
+                username=username,
+                username_set=username_set,
+                username_error=username_error,
+            )
 
     async def verify_session(self, session_row: dict[str, Any], auto_set_username: bool = False) -> dict[str, Any]:
         async with self.locked_client(session_row["session_file"]) as client:

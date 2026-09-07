@@ -18,6 +18,14 @@ def slugify(value: str) -> str:
     return value or "session"
 
 
+def normalize_login_code(value: str) -> str:
+    raw = (value or "").strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if 4 <= len(digits) <= 8:
+        return digits
+    return raw
+
+
 def parse_links(text: str) -> list[str]:
     seen: set[str] = set()
     items: list[str] = []

@@ -17,7 +17,7 @@ from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, 
 from .config import AppConfig, load_config
 from .db import Database
 from .telegram_mtproto import TelethonManager
-from .utils import chunked, format_dt, now_iso, parse_links, parse_user_datetime
+from .utils import chunked, format_dt, normalize_login_code, now_iso, parse_links, parse_user_datetime
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger("dsqfbot")
@@ -208,46 +208,31 @@ class DsqfBotApp:
             phone=payload["phone"],
             session_file=payload["session_file"],
             is_premium=result.is_premium,
-            status="pending",
+            status="online",
         )
         self.db.clear_user_state(user_id)
-        session_row = self.db.get_session(session_id)
-        if not session_row:
+        if not self.db.get_session(session_id):
             await self.render(update, "账号已登录，但本地保存失败。")
             return
-        try:
-            info = await self.telethon.verify_session(session_row, auto_set_username=True)
-            self.db.update_session(
-                session_id,
-                status="online",
-                is_premium=int(info["is_premium"]),
-                label=payload["label"],
-                last_error="",
-            )
-            extra = ""
-            if info.get("username_set") and info.get("username"):
-                extra = f"\n已自动生成用户名：@{info['username']}"
-            elif info.get("username_error"):
-                extra = f"\n未能自动生成用户名：{info['username_error']}"
-            await self.render(
-                update,
-                f"账号添加成功：{payload['label']}，Premium：{'是' if info['is_premium'] else '否'}{extra}",
-                self.account_detail_keyboard(session_id),
-            )
-        except Exception as exc:
-            message = self.telethon.describe_error(exc)
-            self.db.update_session(
-                session_id,
-                status="offline",
-                is_premium=int(result.is_premium),
-                last_error=f"登录成功，但会话校验失败：{message}",
-            )
-            await self.render(
-                update,
-                "验证码已通过，但当前会话没有通过 Telegram 二次校验，账号先记为掉线。\n"
-                "这通常是刚登录就被撤销，或当前号码/环境被风控了。",
-                self.account_detail_keyboard(session_id),
-            )
+        self.db.update_session(
+            session_id,
+            status="online",
+            is_premium=int(result.is_premium),
+            label=payload["label"],
+            last_error="",
+        )
+        extra = ""
+        if result.username_set and result.username:
+            extra = f"\n已自动生成用户名：@{result.username}"
+        elif result.username:
+            extra = f"\n用户名：@{result.username}"
+        elif result.username_error:
+            extra = f"\n未能自动生成用户名：{result.username_error}"
+        await self.render(
+            update,
+            f"账号添加成功：{payload['label']}，Premium：{'是' if result.is_premium else '否'}{extra}",
+            self.account_detail_keyboard(session_id),
+        )
 
     def ensure_unique_label(self, label: str, used_labels: set[str] | None = None) -> str:
         existing = used_labels if used_labels is not None else {item["label"] for item in self.db.list_sessions()}
@@ -342,14 +327,17 @@ class DsqfBotApp:
             return
         try:
             if state == "wait_session_code":
+                login_code = normalize_login_code(text)
+                if not login_code or not login_code.isdigit():
+                    await self.render(update, "没识别到有效验证码，重新发一次纯数字验证码给我。", self.state_cancel_keyboard())
+                    return
                 result = await self.telethon.finish_login(
                     session_file=payload["session_file"],
                     phone=payload["phone"],
-                    code=text,
+                    code=login_code,
                     phone_code_hash=payload["phone_code_hash"],
                 )
                 if result.need_password:
-                    payload["code"] = text
                     self.db.set_user_state(user_id, "wait_session_password", payload)
                     await self.render(update, "这个号开了二步验证。把二步密码发给我。", self.state_cancel_keyboard())
                     return
@@ -359,8 +347,8 @@ class DsqfBotApp:
                 result = await self.telethon.finish_login(
                     session_file=payload["session_file"],
                     phone=payload["phone"],
-                    code=payload.get("code", "00000"),
-                    phone_code_hash=payload["phone_code_hash"],
+                    code=None,
+                    phone_code_hash=None,
                     password=text,
                 )
                 await self.finalize_session_login(update, user_id, payload, result)
