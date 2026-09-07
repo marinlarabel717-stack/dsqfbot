@@ -696,19 +696,34 @@ class DsqfBotApp:
                     await self.render(update, "账号不存在。")
                     return
                 try:
-                    items = await self.telethon.list_groups(session_row)
+                    sync_result = await self.telethon.list_groups(session_row)
+                    items = list(sync_result.get("items") or [])
+                    is_partial = bool(sync_result.get("is_partial"))
+                    active_peer_ids: set[int] = set()
                     for item in items:
+                        peer_id = int(item["peer_id"])
+                        active_peer_ids.add(peer_id)
                         self.db.upsert_group(
                             session_id,
-                            item["peer_id"],
+                            peer_id,
                             item["title"],
                             item["username"],
                             item["link"],
                             is_channel=bool(item.get("is_channel")),
                         )
+                    removed_count = 0
+                    if not is_partial:
+                        removed_count = self.db.mark_missing_groups_left(session_id, active_peer_ids)
                     self.db.update_session(session_id, status="online", last_error="")
                     group_count = sum(1 for item in items if not item.get("is_channel"))
-                    await self.render(update, f"同步完成，共 {group_count} 个群。频道已自动隐藏。", self.account_detail_keyboard(session_id))
+                    if is_partial:
+                        sync_note = f"同步完成（部分），本次扫到 {group_count} 个群。由于 Telegram 对话异常，暂未清理旧记录。"
+                    else:
+                        sync_note = f"同步完成，共 {group_count} 个群。"
+                        if removed_count:
+                            sync_note += f" 已清理 {removed_count} 条旧群/频道记录。"
+                        sync_note += " 频道已自动隐藏。"
+                    await self.render(update, sync_note, self.account_detail_keyboard(session_id))
                 except Exception as exc:
                     error_message = self.telethon.describe_error(exc)
                     fields: dict[str, Any] = {"last_error": error_message}

@@ -433,13 +433,13 @@ class TelethonManager:
                 "username_error": username_error,
             }
 
-    async def list_groups(self, session_row: dict[str, Any]) -> list[dict[str, Any]]:
+    async def list_groups(self, session_row: dict[str, Any]) -> dict[str, Any]:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             return await self._list_groups_resilient(client)
 
-    async def _list_groups_resilient(self, client: TelegramClient) -> list[dict[str, Any]]:
+    async def _list_groups_resilient(self, client: TelegramClient) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
         seen_peer_ids: set[int] = set()
         offset_date: datetime | None = None
@@ -447,6 +447,7 @@ class TelethonManager:
         offset_peer: Any = types.InputPeerEmpty()
         ignore_pinned = True
         batch_size = 50
+        is_partial = False
 
         while True:
             try:
@@ -478,11 +479,11 @@ class TelethonManager:
                         exc.__class__.__name__,
                         exc,
                     )
-                    return items
+                    return {"items": items, "is_partial": True}
                 raise RuntimeError("同步群组时遇到 Telegram 异常对话，请稍后重试")
 
             if not dialogs:
-                return items
+                return {"items": items, "is_partial": is_partial}
 
             for dialog in dialogs:
                 try:
@@ -507,6 +508,7 @@ class TelethonManager:
                         }
                     )
                 except Exception as exc:
+                    is_partial = True
                     LOGGER.warning("skip malformed dialog during sync: %s", exc)
                     continue
 
@@ -517,14 +519,14 @@ class TelethonManager:
                 next_offset_date = last_dialog.date
             except Exception as exc:
                 LOGGER.warning("stop dialog sync pagination due to malformed offset dialog: %s", exc)
-                return items
+                return {"items": items, "is_partial": True}
             if next_offset_peer == offset_peer and last_offset_id == offset_id:
-                return items
+                return {"items": items, "is_partial": is_partial}
             offset_peer = next_offset_peer
             offset_id = last_offset_id
             offset_date = next_offset_date
             if len(dialogs) < batch_size:
-                return items
+                return {"items": items, "is_partial": is_partial}
 
     async def join_link(self, session_row: dict[str, Any], link: str) -> dict[str, Any]:
         link = normalize_link(link)

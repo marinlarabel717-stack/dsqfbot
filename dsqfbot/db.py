@@ -246,6 +246,37 @@ class Database:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def mark_missing_groups_left(
+        self,
+        session_id: int,
+        active_peer_ids: set[int],
+        *,
+        speak_status: str = "同步后已移除",
+    ) -> int:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, peer_id FROM groups WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+            stale_ids = [
+                int(row["id"])
+                for row in rows
+                if int(row["peer_id"] or 0) > 0 and int(row["peer_id"]) not in active_peer_ids
+            ]
+            if not stale_ids:
+                return 0
+            placeholders = ", ".join("?" for _ in stale_ids)
+            now = now_iso()
+            conn.execute(
+                f"""
+                UPDATE groups
+                SET join_status = ?, speak_status = ?, last_error = '', last_checked_at = ?, updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                ("left", speak_status, now, now, *stale_ids),
+            )
+            return len(stale_ids)
+
     def get_group(self, group_id: int) -> dict[str, Any] | None:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM groups WHERE id = ?", (group_id,)).fetchone()
