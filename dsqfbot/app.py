@@ -520,6 +520,9 @@ class DsqfBotApp:
                             f"开始：{format_dt(when.isoformat(), self.config.default_timezone)}\n"
                             f"最后一条：{format_dt(last_when.isoformat(), self.config.default_timezone)}"
                         )
+                        runtime_note = self.repeat_runtime_note(payload["repeat_mode"])
+                        if runtime_note:
+                            final_text += f"\n{runtime_note}"
                         if not await update_progress_text(final_text, self.tasks_keyboard()):
                             await self.render(update, final_text, self.tasks_keyboard())
                         return
@@ -541,7 +544,11 @@ class DsqfBotApp:
                         status="scheduled",
                     )
                     self.db.clear_user_state(user_id)
-                    await self.render(update, f"定时消息创建成功，任务 ID：{task_id}", self.task_detail_keyboard(task_id))
+                    success_text = f"定时消息创建成功，任务 ID：{task_id}"
+                    runtime_note = self.repeat_runtime_note(payload["repeat_mode"])
+                    if runtime_note:
+                        success_text += f"\n{runtime_note}"
+                    await self.render(update, success_text, self.task_detail_keyboard(task_id))
                 except Exception as exc:
                     message = self.telethon.describe_error(exc)
                     self.db.update_group(group_row["id"], speak_status=message, last_error=message)
@@ -1084,6 +1091,11 @@ class DsqfBotApp:
             return f"每 {interval_minutes} 分钟排满"
         return "单次"
 
+    def repeat_runtime_note(self, repeat_mode: str) -> str | None:
+        if self.is_daily_repeat_mode(repeat_mode):
+            return "注：每天重复由机器人后台自动续排，Telegram 里看到的是当前已排到的消息，不会显示成原生重复任务。"
+        return None
+
     async def create_interval_schedule_batch(
         self,
         session_row: dict[str, Any],
@@ -1489,7 +1501,12 @@ class DsqfBotApp:
         lines = [f"定时任务列表（第 {current_page + 1}/{total_pages} 页，共 {total} 条）", "点下方“查看任务”后，把任务编号发给我。"]
         for item in tasks:
             repeat_text = self.repeat_mode_text(item["repeat_mode"])
-            lines.append(f"{item['id']}. {item['group_title']} | {format_dt(item['schedule_at'], self.config.default_timezone)} | {repeat_text} | {self.human_task_status(item['status'])}")
+            is_daily = self.is_daily_repeat_mode(item["repeat_mode"])
+            display_time = item["next_run_at"] if is_daily and item.get("next_run_at") else item["schedule_at"]
+            time_label = "下次" if is_daily and item.get("next_run_at") else "时间"
+            lines.append(
+                f"{item['id']}. {item['group_title']} | {time_label} {format_dt(display_time, self.config.default_timezone)} | {repeat_text} | {self.human_task_status(item['status'])}"
+            )
         return "\n".join(lines)
 
     def tasks_keyboard(self, page: int = 0) -> InlineKeyboardMarkup:
@@ -1517,15 +1534,22 @@ class DsqfBotApp:
         item = self.db.get_task(task_id)
         if not item:
             return "任务不存在。"
-        return (
-            f"任务 ID：{item['id']}\n"
-            f"账号：{item['session_label']}\n"
-            f"群：{item['group_title']}\n"
-            f"时间：{format_dt(item['schedule_at'], self.config.default_timezone)}\n"
-            f"重复：{self.repeat_mode_text(item['repeat_mode'])}\n"
-            f"状态：{self.human_task_status(item['status'])}\n"
-            f"错误：{item['last_error'] or '-'}"
-        )
+        lines = [
+            f"任务 ID：{item['id']}",
+            f"账号：{item['session_label']}",
+            f"群：{item['group_title']}",
+            f"首次：{format_dt(item['schedule_at'], self.config.default_timezone)}",
+            f"重复：{self.repeat_mode_text(item['repeat_mode'])}",
+            f"状态：{self.human_task_status(item['status'])}",
+            f"错误：{item['last_error'] or '-'}",
+        ]
+        if self.is_daily_repeat_mode(item["repeat_mode"]):
+            next_run_at = item.get("next_run_at")
+            lines.insert(4, f"下次：{format_dt(next_run_at, self.config.default_timezone) if next_run_at else '-'}")
+            runtime_note = self.repeat_runtime_note(item["repeat_mode"])
+            if runtime_note:
+                lines.append(runtime_note)
+        return "\n".join(lines)
 
     def scheduled_messages_text(self, group_row: dict[str, Any], messages: list[dict[str, Any]]) -> str:
         if not messages:
@@ -1536,6 +1560,8 @@ class DsqfBotApp:
             if len(preview) > 24:
                 preview = preview[:24] + "..."
             lines.append(f"{item['message_id']}. {format_dt(item['schedule_at'], self.config.default_timezone)} | {preview or '[空消息]'}")
+        lines.append("")
+        lines.append("注：如果你建的是每天重复，这里显示的是 Telegram 当前已排到的消息；后续日期由机器人后台自动续排。")
         return "\n".join(lines)
 
     def scheduled_messages_keyboard(self, group_id: int) -> InlineKeyboardMarkup:
