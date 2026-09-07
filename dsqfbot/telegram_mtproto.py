@@ -710,12 +710,15 @@ class TelethonManager:
             schedule_repeat_period=repeat_period,
         )
         try:
-            await client(request)
+            result = await client(request)
         except Exception:
             matched_id = await self._find_new_scheduled_message_id(client, entity, before_ids, message_text, when, repeat_period)
             if matched_id is not None:
                 return matched_id
             raise
+        matched_id = self._extract_scheduled_message_id_from_result(result, before_ids, message_text, when, repeat_period)
+        if matched_id is not None:
+            return matched_id
         matched_id = await self._find_new_scheduled_message_id(client, entity, before_ids, message_text, when, repeat_period)
         if matched_id is None:
             raise RuntimeError("Telegram 没有返回新建的原生重复定时消息")
@@ -735,29 +738,144 @@ class TelethonManager:
         repeat_period: int | None = None,
     ) -> int | None:
         target_text = (message_text or "").strip()
-        target_iso = self._as_utc(when).isoformat()
-        for _ in range(8):
-            await asyncio.sleep(0.35)
+        saw_new_messages = False
+        for _ in range(10):
+            await asyncio.sleep(0.5)
             result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
-            candidates: list[int] = []
-            for message in getattr(result, "messages", []):
-                message_id = int(getattr(message, "id", 0) or 0)
-                if message_id <= 0 or message_id in before_ids:
-                    continue
-                date_value = getattr(message, "date", None)
-                message_iso = self._as_utc(date_value).isoformat() if isinstance(date_value, datetime) else None
-                if target_text and (getattr(message, "message", "") or "").strip() != target_text:
-                    continue
-                if message_iso and message_iso != target_iso:
-                    continue
-                actual_repeat = read_schedule_repeat_period(message)
-                if repeat_period and actual_repeat not in {None, repeat_period}:
-                    continue
-                candidates.append(message_id)
-            if candidates:
-                candidates.sort(reverse=True)
-                return candidates[0]
+            messages = [message for message in getattr(result, "messages", []) if int(getattr(message, "id", 0) or 0) > 0]
+            if any(int(getattr(message, "id", 0) or 0) not in before_ids for message in messages):
+                saw_new_messages = True
+            matched = self._match_scheduled_message(messages, before_ids, target_text, when, repeat_period)
+            if matched is not None:
+                return matched
+        if saw_new_messages:
+            result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
+            messages = [message for message in getattr(result, "messages", []) if int(getattr(message, "id", 0) or 0) > 0]
+            return self._fallback_newest_scheduled_message(messages, before_ids, target_text, when)
         return None
+
+    def _extract_scheduled_message_id_from_result(
+        self,
+        result: Any,
+        before_ids: set[int],
+        message_text: str,
+        when: datetime,
+        repeat_period: int | None = None,
+    ) -> int | None:
+        messages = self._collect_scheduled_messages_from_result(result)
+        return self._match_scheduled_message(messages, before_ids, (message_text or "").strip(), when, repeat_period)
+
+    def _collect_scheduled_messages_from_result(self, result: Any) -> list[Any]:
+        queue: list[Any] = []
+        seen_ids: set[int] = set()
+        messages: list[Any] = []
+
+        def push(item: Any) -> None:
+            if item is None:
+                return
+            item_id = id(item)
+            if item_id in seen_ids:
+                return
+            seen_ids.add(item_id)
+            queue.append(item)
+
+        push(result)
+        while queue:
+            current = queue.pop(0)
+            class_name = current.__class__.__name__
+            if class_name == "Message":
+                messages.append(current)
+                continue
+            if class_name == "UpdateNewScheduledMessage":
+                push(getattr(current, "message", None))
+                continue
+            updates = getattr(current, "updates", None)
+            if isinstance(updates, list):
+                for update in updates:
+                    push(update)
+            nested_update = getattr(current, "update", None)
+            if nested_update is not None:
+                push(nested_update)
+            nested_message = getattr(current, "message", None)
+            if nested_message is not None:
+                push(nested_message)
+        return messages
+
+    def _match_scheduled_message(
+        self,
+        messages: list[Any],
+        before_ids: set[int],
+        target_text: str,
+        when: datetime,
+        repeat_period: int | None = None,
+    ) -> int | None:
+        target_when = self._as_utc(when)
+        scored: list[tuple[int, int]] = []
+        for message in messages:
+            message_id = int(getattr(message, "id", 0) or 0)
+            if message_id <= 0 or message_id in before_ids:
+                continue
+            score = 0
+            message_text = (getattr(message, "message", "") or "").strip()
+            if target_text:
+                if message_text == target_text:
+                    score += 80
+                elif message_text and (target_text in message_text or message_text in target_text):
+                    score += 25
+                else:
+                    score -= 80
+            date_value = getattr(message, "date", None)
+            if isinstance(date_value, datetime):
+                seconds_diff = abs((self._as_utc(date_value) - target_when).total_seconds())
+                if seconds_diff <= 5:
+                    score += 30
+                elif seconds_diff <= 60:
+                    score += 20
+                elif seconds_diff <= 300:
+                    score += 10
+                else:
+                    score -= 10
+            actual_repeat = read_schedule_repeat_period(message)
+            if repeat_period and repeat_period > 0:
+                if actual_repeat == repeat_period:
+                    score += 50
+                elif actual_repeat and actual_repeat != repeat_period:
+                    score -= 100
+            scored.append((score, message_id))
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        best_score, best_id = scored[0]
+        if best_score < 0:
+            return None
+        return best_id
+
+    def _fallback_newest_scheduled_message(
+        self,
+        messages: list[Any],
+        before_ids: set[int],
+        target_text: str,
+        when: datetime,
+    ) -> int | None:
+        target_when = self._as_utc(when)
+        candidates: list[int] = []
+        for message in messages:
+            message_id = int(getattr(message, "id", 0) or 0)
+            if message_id <= 0 or message_id in before_ids:
+                continue
+            message_text = (getattr(message, "message", "") or "").strip()
+            if target_text and message_text and message_text != target_text:
+                continue
+            date_value = getattr(message, "date", None)
+            if isinstance(date_value, datetime):
+                seconds_diff = abs((self._as_utc(date_value) - target_when).total_seconds())
+                if seconds_diff > 300:
+                    continue
+            candidates.append(message_id)
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return candidates[0]
 
     @staticmethod
     def _as_utc(value: datetime) -> datetime:
