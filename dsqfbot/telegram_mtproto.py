@@ -6,6 +6,7 @@ import random
 import re
 import struct
 import string
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -280,6 +281,7 @@ class TelethonManager:
         self.config.session_dir.mkdir(parents=True, exist_ok=True)
         install_repeat_support_patch()
         self._supports_repeat = True
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     def session_path(self, session_file: str) -> str:
         return str((self.config.session_dir / session_file).resolve())
@@ -299,6 +301,23 @@ class TelethonManager:
             system_lang_code=self.config.client_system_lang_code,
         )
 
+    def _get_session_lock(self, session_file: str) -> asyncio.Lock:
+        lock = self._session_locks.get(session_file)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_file] = lock
+        return lock
+
+    @asynccontextmanager
+    async def locked_client(self, session_file: str):
+        async with self._get_session_lock(session_file):
+            client = self.build_client(session_file)
+            await client.connect()
+            try:
+                yield client
+            finally:
+                await client.disconnect()
+
     def delete_session_files(self, session_file: str) -> None:
         base_path = Path(self.session_path(session_file))
         candidates = [base_path, self.session_sqlite_path(session_file), self.session_sqlite_path(session_file).with_suffix(".session-journal")]
@@ -310,9 +329,7 @@ class TelethonManager:
                 continue
 
     async def inspect_session(self, session_file: str) -> dict[str, Any]:
-        client = self.build_client(session_file)
-        await client.connect()
-        try:
+        async with self.locked_client(session_file) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             me = await client.get_me()
@@ -324,18 +341,12 @@ class TelethonManager:
                 "is_premium": bool(getattr(me, "premium", False)),
                 "username": getattr(me, "username", None),
             }
-        finally:
-            await client.disconnect()
 
     async def begin_login(self, label: str, phone: str) -> tuple[str, str]:
         session_file = f"{slugify(label)}-{int(datetime.utcnow().timestamp())}"
-        client = self.build_client(session_file)
-        await client.connect()
-        try:
+        async with self.locked_client(session_file) as client:
             sent = await client.send_code_request(phone)
             return session_file, sent.phone_code_hash
-        finally:
-            await client.disconnect()
 
     async def finish_login(
         self,
@@ -345,9 +356,7 @@ class TelethonManager:
         phone_code_hash: str,
         password: str | None = None,
     ) -> LoginResult:
-        client = self.build_client(session_file)
-        await client.connect()
-        try:
+        async with self.locked_client(session_file) as client:
             try:
                 await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash, password=password)
             except errors.SessionPasswordNeededError:
@@ -355,13 +364,9 @@ class TelethonManager:
             me = await client.get_me()
             label = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip()
             return LoginResult(need_password=False, label=label or phone, is_premium=bool(getattr(me, "premium", False)))
-        finally:
-            await client.disconnect()
 
     async def verify_session(self, session_row: dict[str, Any], auto_set_username: bool = False) -> dict[str, Any]:
-        client = self.build_client(session_row["session_file"])
-        await client.connect()
-        try:
+        async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             me = await client.get_me()
@@ -381,13 +386,9 @@ class TelethonManager:
                 "username_set": username_set,
                 "username_error": username_error,
             }
-        finally:
-            await client.disconnect()
 
     async def list_groups(self, session_row: dict[str, Any]) -> list[dict[str, Any]]:
-        client = self.build_client(session_row["session_file"])
-        await client.connect()
-        try:
+        async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             dialogs = await client.get_dialogs(limit=200)
@@ -405,14 +406,10 @@ class TelethonManager:
                     }
                 )
             return items
-        finally:
-            await client.disconnect()
 
     async def join_link(self, session_row: dict[str, Any], link: str) -> dict[str, Any]:
         link = normalize_link(link)
-        client = self.build_client(session_row["session_file"])
-        await client.connect()
-        try:
+        async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             invite_match = INVITE_RE.search(link)
@@ -482,8 +479,6 @@ class TelethonManager:
                     "join_status": "joined",
                 }
             raise RuntimeError("无法识别群链接")
-        finally:
-            await client.disconnect()
 
     async def schedule_message(
         self,
@@ -493,9 +488,7 @@ class TelethonManager:
         when: datetime,
         repeat_period: int | None = None,
     ) -> int:
-        client = self.build_client(session_row["session_file"])
-        await client.connect()
-        try:
+        async with self.locked_client(session_row["session_file"]) as client:
             entity = await self._resolve_entity(client, group_row)
             try:
                 if repeat_period and repeat_period > 0:
@@ -514,13 +507,9 @@ class TelethonManager:
                     return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
                 message = await client.send_message(entity, message_text, schedule=when)
             return int(message.id)
-        finally:
-            await client.disconnect()
 
     async def list_scheduled_messages(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> list[dict[str, Any]]:
-        client = self.build_client(session_row["session_file"])
-        await client.connect()
-        try:
+        async with self.locked_client(session_row["session_file"]) as client:
             entity = await self._resolve_entity(client, group_row)
             result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
             items: list[dict[str, Any]] = []
@@ -535,22 +524,14 @@ class TelethonManager:
                     }
                 )
             return items
-        finally:
-            await client.disconnect()
 
     async def delete_scheduled_message(self, session_row: dict[str, Any], group_row: dict[str, Any], message_id: int) -> None:
-        client = self.build_client(session_row["session_file"])
-        await client.connect()
-        try:
+        async with self.locked_client(session_row["session_file"]) as client:
             entity = await self._resolve_entity(client, group_row)
             await client(DeleteScheduledMessagesRequest(peer=entity, id=[message_id]))
-        finally:
-            await client.disconnect()
 
     async def detect_group_status(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> dict[str, str]:
-        client = self.build_client(session_row["session_file"])
-        await client.connect()
-        try:
+        async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             try:
@@ -586,13 +567,9 @@ class TelethonManager:
             if probe_error == "未加入群":
                 return {"join_status": "not_joined", "speak_status": probe_error, "last_error": probe_error}
             return {"join_status": "joined", "speak_status": probe_error or "无发言权限", "last_error": probe_error or "无发言权限"}
-        finally:
-            await client.disconnect()
 
     async def leave_group(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> None:
-        client = self.build_client(session_row["session_file"])
-        await client.connect()
-        try:
+        async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             entity = await self._resolve_entity(client, group_row)
@@ -603,8 +580,6 @@ class TelethonManager:
                     await client.delete_dialog(entity)
             except Exception:
                 await client.delete_dialog(entity)
-        finally:
-            await client.disconnect()
 
     async def _resolve_entity(self, client: TelegramClient, group_row: dict[str, Any]):
         if group_row.get("username"):
@@ -917,6 +892,8 @@ class TelethonManager:
         if name in mapping:
             return mapping[name]
         message = str(exc).strip() or name
+        if "database is locked" in message.lower():
+            return "账号本地会话正忙，请稍后重试"
         if "A wait of" in message:
             return f"风控等待 {TelethonManager.extract_wait_seconds(exc)} 秒"
         return message
