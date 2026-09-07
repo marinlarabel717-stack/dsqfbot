@@ -36,7 +36,6 @@ class DsqfBotApp:
     async def on_startup(self, application: Application) -> None:
         self.application = application
         self._tasks.append(asyncio.create_task(self.join_worker(), name="join-worker"))
-        self._tasks.append(asyncio.create_task(self.repeat_worker(), name="repeat-worker"))
         LOGGER.info("workers started")
 
     async def on_shutdown(self, application: Application) -> None:
@@ -527,11 +526,15 @@ class DsqfBotApp:
                             await self.render(update, final_text, self.tasks_keyboard())
                         return
 
-                    message_id = await self.telethon.schedule_message(session_row, group_row, payload["message_text"], when)
-                    next_run_at = None
+                    message_id = await self.telethon.schedule_message(
+                        session_row,
+                        group_row,
+                        payload["message_text"],
+                        when,
+                        repeat_period=self.telethon.daily_repeat_period() if daily_repeat else None,
+                    )
+                    next_run_at = when.isoformat() if daily_repeat else None
                     last_scheduled_for = when.isoformat()
-                    if daily_repeat:
-                        next_run_at = self.telethon.next_daily_run(when).isoformat()
                     task_id = self.db.create_task(
                         session_id=session_row["id"],
                         group_id=group_row["id"],
@@ -1074,7 +1077,7 @@ class DsqfBotApp:
         if self.is_daily_repeat_mode(repeat_mode):
             return (
                 "把第一条发送时间发给我，格式：2026-09-06 10:30\n"
-                f"当前模式：每条都设为每天重复，并按每 {interval_minutes} 分钟自动往后排，直到 Telegram 定时上限"
+                f"当前模式：每条都设为 Telegram 原生每天重复，并按每 {interval_minutes} 分钟往后排，直到 Telegram 定时上限"
             )
         return (
             "把第一条发送时间发给我，格式：2026-09-06 10:30\n"
@@ -1093,8 +1096,20 @@ class DsqfBotApp:
 
     def repeat_runtime_note(self, repeat_mode: str) -> str | None:
         if self.is_daily_repeat_mode(repeat_mode):
-            return "注：每天重复由机器人后台自动续排，Telegram 里看到的是当前已排到的消息，不会显示成原生重复任务。"
+            return "注：已按 Telegram 原生重复创建，客户端里会直接显示为“重复：每天”。"
         return None
+
+    def task_next_run_at(self, item: dict[str, Any]) -> str | None:
+        if not self.is_daily_repeat_mode(item["repeat_mode"]):
+            return item.get("schedule_at")
+        schedule_at = item.get("schedule_at")
+        if not schedule_at:
+            return item.get("next_run_at")
+        try:
+            when = datetime.fromisoformat(schedule_at)
+        except ValueError:
+            return item.get("next_run_at") or schedule_at
+        return self.telethon.next_daily_run(when).isoformat()
 
     async def create_interval_schedule_batch(
         self,
@@ -1115,14 +1130,20 @@ class DsqfBotApp:
         daily_repeat = self.is_daily_repeat_mode(repeat_mode)
         for offset in range(remaining):
             when = first_when + timedelta(minutes=interval_minutes * offset)
-            message_id = await self.telethon.schedule_message(session_row, group_row, message_text, when)
+            message_id = await self.telethon.schedule_message(
+                session_row,
+                group_row,
+                message_text,
+                when,
+                repeat_period=self.telethon.daily_repeat_period() if daily_repeat else None,
+            )
             task_id = self.db.create_task(
                 session_id=session_row["id"],
                 group_id=group_row["id"],
                 message_text=message_text,
                 schedule_at=when.isoformat(),
                 repeat_mode=repeat_mode,
-                next_run_at=self.telethon.next_daily_run(when).isoformat() if daily_repeat else None,
+                next_run_at=when.isoformat() if daily_repeat else None,
                 last_scheduled_for=when.isoformat(),
                 last_telegram_message_id=message_id,
                 status="scheduled",
@@ -1243,14 +1264,20 @@ class DsqfBotApp:
                         last_scheduled_at = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
                     current_action = f"已创建 {len(task_ids)} 条"
                 else:
-                    message_id = await self.telethon.schedule_message(session_row, group_row, payload["message_text"], when)
+                    message_id = await self.telethon.schedule_message(
+                        session_row,
+                        group_row,
+                        payload["message_text"],
+                        when,
+                        repeat_period=self.telethon.daily_repeat_period() if daily_repeat else None,
+                    )
                     task_id = self.db.create_task(
                         session_id=session_row["id"],
                         group_id=group_row["id"],
                         message_text=payload["message_text"],
                         schedule_at=when.isoformat(),
                         repeat_mode=repeat_mode,
-                        next_run_at=self.telethon.next_daily_run(when).isoformat() if daily_repeat else None,
+                        next_run_at=when.isoformat() if daily_repeat else None,
                         last_scheduled_for=when.isoformat(),
                         last_telegram_message_id=message_id,
                         status="scheduled",
@@ -1502,8 +1529,8 @@ class DsqfBotApp:
         for item in tasks:
             repeat_text = self.repeat_mode_text(item["repeat_mode"])
             is_daily = self.is_daily_repeat_mode(item["repeat_mode"])
-            display_time = item["next_run_at"] if is_daily and item.get("next_run_at") else item["schedule_at"]
-            time_label = "下次" if is_daily and item.get("next_run_at") else "时间"
+            display_time = self.task_next_run_at(item) if is_daily else item["schedule_at"]
+            time_label = "下次" if is_daily else "时间"
             lines.append(
                 f"{item['id']}. {item['group_title']} | {time_label} {format_dt(display_time, self.config.default_timezone)} | {repeat_text} | {self.human_task_status(item['status'])}"
             )
@@ -1544,7 +1571,7 @@ class DsqfBotApp:
             f"错误：{item['last_error'] or '-'}",
         ]
         if self.is_daily_repeat_mode(item["repeat_mode"]):
-            next_run_at = item.get("next_run_at")
+            next_run_at = self.task_next_run_at(item)
             lines.insert(4, f"下次：{format_dt(next_run_at, self.config.default_timezone) if next_run_at else '-'}")
             runtime_note = self.repeat_runtime_note(item["repeat_mode"])
             if runtime_note:
@@ -1559,9 +1586,8 @@ class DsqfBotApp:
             preview = (item["text"] or "").replace("\n", " ")
             if len(preview) > 24:
                 preview = preview[:24] + "..."
-            lines.append(f"{item['message_id']}. {format_dt(item['schedule_at'], self.config.default_timezone)} | {preview or '[空消息]'}")
-        lines.append("")
-        lines.append("注：如果你建的是每天重复，这里显示的是 Telegram 当前已排到的消息；后续日期由机器人后台自动续排。")
+            repeat_label = " | 重复：每天" if int(item.get("repeat_period") or 0) == self.telethon.daily_repeat_period() else ""
+            lines.append(f"{item['message_id']}. {format_dt(item['schedule_at'], self.config.default_timezone)}{repeat_label} | {preview or '[空消息]'}")
         return "\n".join(lines)
 
     def scheduled_messages_keyboard(self, group_id: int) -> InlineKeyboardMarkup:
@@ -1672,35 +1698,6 @@ class DsqfBotApp:
                     if batch_id:
                         await self.refresh_join_batch_message(int(batch_id))
             await asyncio.sleep(1)
-
-    async def repeat_worker(self) -> None:
-        while True:
-            self.prune_completed_once_tasks()
-            horizon = (datetime.utcnow() + timedelta(minutes=self.config.repeat_lookahead_minutes)).replace(microsecond=0).isoformat()
-            for task in self.db.list_due_repeat_tasks(horizon):
-                session_row = self.db.get_session(task["session_id"])
-                group_row = self.db.get_group(task["group_id"])
-                if not session_row or not group_row:
-                    self.db.update_task(task["id"], status="failed", last_error="账号或群不存在")
-                    continue
-                when = datetime.fromisoformat(task["next_run_at"])
-                try:
-                    message_id = await self.telethon.schedule_message(session_row, group_row, task["message_text"], when)
-                    self.db.update_task(
-                        task["id"],
-                        last_telegram_message_id=message_id,
-                        last_scheduled_for=task["next_run_at"],
-                        next_run_at=self.telethon.next_daily_run(when).isoformat(),
-                        last_error="",
-                    )
-                except Exception as exc:
-                    message = self.telethon.describe_error(exc)
-                    self.db.update_task(task["id"], last_error=message)
-                    self.db.update_group(group_row["id"], speak_status=message, last_error=message)
-                    if message == "账号掉线":
-                        self.db.update_session(session_row["id"], status="offline", last_error=message)
-            await asyncio.sleep(30)
-
 
 def build_application(config: AppConfig, db: Database, telethon: TelethonManager) -> Application:
     runtime = DsqfBotApp(config, db, telethon)

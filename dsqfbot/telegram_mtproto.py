@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-import inspect
+import asyncio
+import os
 import random
 import re
+import struct
 import string
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, errors, functions
+from telethon.tl import alltlobjects, patched as patched_types, types
 from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
@@ -18,6 +21,7 @@ from telethon.tl.functions.messages import (
     ImportChatInviteRequest,
     SendMessageRequest,
 )
+from telethon.tl.tlobject import TLRequest
 
 from .config import AppConfig
 from .utils import normalize_link, slugify
@@ -25,6 +29,241 @@ from .utils import normalize_link, slugify
 
 INVITE_RE = re.compile(r"(?:https?://)?t\.me/(?:joinchat/|\+)([A-Za-z0-9_-]+)", re.IGNORECASE)
 PUBLIC_RE = re.compile(r"(?:https?://)?t\.me/([A-Za-z0-9_]{4,})/?$", re.IGNORECASE)
+TELEGRAM_DAILY_REPEAT_PERIOD = 24 * 60 * 60
+CURRENT_MESSAGE_CONSTRUCTOR_ID = 0x3AE56482
+CURRENT_REPEAT_SEND_MESSAGE_CONSTRUCTOR_ID = 0x545CD15A
+
+
+class SendMessageWithRepeatRequest(TLRequest):
+    CONSTRUCTOR_ID = CURRENT_REPEAT_SEND_MESSAGE_CONSTRUCTOR_ID
+    SUBCLASS_OF_ID = SendMessageRequest.SUBCLASS_OF_ID
+
+    def __init__(
+        self,
+        peer: Any,
+        message: str,
+        no_webpage: bool | None = None,
+        silent: bool | None = None,
+        background: bool | None = None,
+        clear_draft: bool | None = None,
+        noforwards: bool | None = None,
+        update_stickersets_order: bool | None = None,
+        invert_media: bool | None = None,
+        allow_paid_floodskip: bool | None = None,
+        reply_to: Any | None = None,
+        random_id: int | None = None,
+        reply_markup: Any | None = None,
+        entities: list[Any] | None = None,
+        schedule_date: datetime | None = None,
+        schedule_repeat_period: int | None = None,
+        send_as: Any | None = None,
+        quick_reply_shortcut: Any | None = None,
+        effect: int | None = None,
+        allow_paid_stars: int | None = None,
+        suggested_post: Any | None = None,
+    ) -> None:
+        self.peer = peer
+        self.message = message
+        self.no_webpage = no_webpage
+        self.silent = silent
+        self.background = background
+        self.clear_draft = clear_draft
+        self.noforwards = noforwards
+        self.update_stickersets_order = update_stickersets_order
+        self.invert_media = invert_media
+        self.allow_paid_floodskip = allow_paid_floodskip
+        self.reply_to = reply_to
+        self.random_id = random_id if random_id is not None else int.from_bytes(os.urandom(8), "big", signed=True)
+        self.reply_markup = reply_markup
+        self.entities = entities
+        self.schedule_date = schedule_date
+        self.schedule_repeat_period = schedule_repeat_period if schedule_repeat_period and schedule_repeat_period > 0 else None
+        self.send_as = send_as
+        self.quick_reply_shortcut = quick_reply_shortcut
+        self.effect = effect
+        self.allow_paid_stars = allow_paid_stars
+        self.suggested_post = suggested_post
+
+    async def resolve(self, client, utils) -> None:
+        self.peer = utils.get_input_peer(await client.get_input_entity(self.peer))
+        if self.send_as:
+            self.send_as = utils.get_input_peer(await client.get_input_entity(self.send_as))
+
+    def _bytes(self) -> bytes:
+        flags = (
+            (0 if self.no_webpage is None or self.no_webpage is False else 2)
+            | (0 if self.silent is None or self.silent is False else 32)
+            | (0 if self.background is None or self.background is False else 64)
+            | (0 if self.clear_draft is None or self.clear_draft is False else 128)
+            | (0 if self.noforwards is None or self.noforwards is False else 16384)
+            | (0 if self.update_stickersets_order is None or self.update_stickersets_order is False else 32768)
+            | (0 if self.invert_media is None or self.invert_media is False else 65536)
+            | (0 if self.allow_paid_floodskip is None or self.allow_paid_floodskip is False else 524288)
+            | (0 if self.reply_to is None or self.reply_to is False else 1)
+            | (0 if self.reply_markup is None or self.reply_markup is False else 4)
+            | (0 if self.entities is None or self.entities is False else 8)
+            | (0 if self.schedule_date is None or self.schedule_date is False else 1024)
+            | (0 if self.send_as is None or self.send_as is False else 8192)
+            | (0 if self.quick_reply_shortcut is None or self.quick_reply_shortcut is False else 131072)
+            | (0 if self.effect is None or self.effect is False else 262144)
+            | (0 if self.allow_paid_stars is None or self.allow_paid_stars is False else 2097152)
+            | (0 if self.suggested_post is None or self.suggested_post is False else 4194304)
+            | (0 if self.schedule_repeat_period is None or self.schedule_repeat_period is False else 16777216)
+        )
+        return b"".join(
+            (
+                struct.pack("<I", self.CONSTRUCTOR_ID),
+                struct.pack("<I", flags),
+                self.peer._bytes(),
+                b"" if self.reply_to is None or self.reply_to is False else self.reply_to._bytes(),
+                self.serialize_bytes(self.message),
+                struct.pack("<q", self.random_id),
+                b"" if self.reply_markup is None or self.reply_markup is False else self.reply_markup._bytes(),
+                b""
+                if self.entities is None or self.entities is False
+                else b"".join((b"\x15\xc4\xb5\x1c", struct.pack("<i", len(self.entities)), b"".join(x._bytes() for x in self.entities))),
+                b"" if self.schedule_date is None or self.schedule_date is False else self.serialize_datetime(self.schedule_date),
+                b"" if self.schedule_repeat_period is None or self.schedule_repeat_period is False else struct.pack("<i", int(self.schedule_repeat_period)),
+                b"" if self.send_as is None or self.send_as is False else self.send_as._bytes(),
+                b"" if self.quick_reply_shortcut is None or self.quick_reply_shortcut is False else self.quick_reply_shortcut._bytes(),
+                b"" if self.effect is None or self.effect is False else struct.pack("<q", self.effect),
+                b"" if self.allow_paid_stars is None or self.allow_paid_stars is False else struct.pack("<q", self.allow_paid_stars),
+                b"" if self.suggested_post is None or self.suggested_post is False else self.suggested_post._bytes(),
+            )
+        )
+
+
+def _patched_message_from_reader(cls, reader):
+    flags = reader.read_int()
+
+    _out = bool(flags & 2)
+    _mentioned = bool(flags & 16)
+    _media_unread = bool(flags & 32)
+    _silent = bool(flags & 8192)
+    _post = bool(flags & 16384)
+    _from_scheduled = bool(flags & 262144)
+    _legacy = bool(flags & 524288)
+    _edit_hide = bool(flags & 2097152)
+    _pinned = bool(flags & 16777216)
+    _noforwards = bool(flags & 67108864)
+    _invert_media = bool(flags & 134217728)
+    flags2 = reader.read_int()
+
+    _offline = bool(flags2 & 2)
+    _video_processing_pending = bool(flags2 & 16)
+    _paid_suggested_post_stars = bool(flags2 & 256)
+    _paid_suggested_post_ton = bool(flags2 & 512)
+    _id = reader.read_int()
+    _from_id = reader.tgread_object() if flags & 256 else None
+    _from_boosts_applied = reader.read_int() if flags & 536870912 else None
+    _from_rank = reader.tgread_string() if flags2 & 4096 else None
+    _peer_id = reader.tgread_object()
+    _saved_peer_id = reader.tgread_object() if flags & 268435456 else None
+    _fwd_from = reader.tgread_object() if flags & 4 else None
+    _via_bot_id = reader.read_long() if flags & 2048 else None
+    _via_business_bot_id = reader.read_long() if flags2 & 1 else None
+    _guestchat_via_from = reader.tgread_object() if flags2 & 524288 else None
+    _reply_to = reader.tgread_object() if flags & 8 else None
+    _date = reader.tgread_date()
+    _message = reader.tgread_string()
+    _media = reader.tgread_object() if flags & 512 else None
+    _reply_markup = reader.tgread_object() if flags & 64 else None
+    if flags & 128:
+        reader.read_int()
+        _entities = [reader.tgread_object() for _ in range(reader.read_int())]
+    else:
+        _entities = None
+    _views = reader.read_int() if flags & 1024 else None
+    _forwards = reader.read_int() if flags & 1024 else None
+    _replies = reader.tgread_object() if flags & 8388608 else None
+    _edit_date = reader.tgread_date() if flags & 32768 else None
+    _post_author = reader.tgread_string() if flags & 65536 else None
+    _grouped_id = reader.read_long() if flags & 131072 else None
+    _reactions = reader.tgread_object() if flags & 1048576 else None
+    if flags & 4194304:
+        reader.read_int()
+        _restriction_reason = [reader.tgread_object() for _ in range(reader.read_int())]
+    else:
+        _restriction_reason = None
+    _ttl_period = reader.read_int() if flags & 33554432 else None
+    _quick_reply_shortcut_id = reader.read_int() if flags & 1073741824 else None
+    _effect = reader.read_long() if flags2 & 4 else None
+    _factcheck = reader.tgread_object() if flags2 & 8 else None
+    _report_delivery_until_date = reader.tgread_date() if flags2 & 32 else None
+    _paid_message_stars = reader.read_long() if flags2 & 64 else None
+    _suggested_post = reader.tgread_object() if flags2 & 128 else None
+    _schedule_repeat_period = reader.read_int() if flags2 & 1024 else None
+    _summary_from_language = reader.tgread_string() if flags2 & 2048 else None
+
+    message = cls(
+        id=_id,
+        peer_id=_peer_id,
+        date=_date,
+        message=_message,
+        out=_out,
+        mentioned=_mentioned,
+        media_unread=_media_unread,
+        silent=_silent,
+        post=_post,
+        from_scheduled=_from_scheduled,
+        legacy=_legacy,
+        edit_hide=_edit_hide,
+        pinned=_pinned,
+        noforwards=_noforwards,
+        invert_media=_invert_media,
+        offline=_offline,
+        video_processing_pending=_video_processing_pending,
+        paid_suggested_post_stars=_paid_suggested_post_stars,
+        paid_suggested_post_ton=_paid_suggested_post_ton,
+        from_id=_from_id,
+        from_boosts_applied=_from_boosts_applied,
+        saved_peer_id=_saved_peer_id,
+        fwd_from=_fwd_from,
+        via_bot_id=_via_bot_id,
+        via_business_bot_id=_via_business_bot_id,
+        reply_to=_reply_to,
+        media=_media,
+        reply_markup=_reply_markup,
+        entities=_entities,
+        views=_views,
+        forwards=_forwards,
+        replies=_replies,
+        edit_date=_edit_date,
+        post_author=_post_author,
+        grouped_id=_grouped_id,
+        reactions=_reactions,
+        restriction_reason=_restriction_reason,
+        ttl_period=_ttl_period,
+        quick_reply_shortcut_id=_quick_reply_shortcut_id,
+        effect=_effect,
+        factcheck=_factcheck,
+        report_delivery_until_date=_report_delivery_until_date,
+        paid_message_stars=_paid_message_stars,
+        suggested_post=_suggested_post,
+    )
+    message.from_rank = _from_rank
+    message.guestchat_via_from = _guestchat_via_from
+    message.schedule_repeat_period = _schedule_repeat_period
+    message.summary_from_language = _summary_from_language
+    return message
+
+
+def install_repeat_support_patch() -> None:
+    patched_types.Message.from_reader = classmethod(_patched_message_from_reader)
+    types.Message.from_reader = classmethod(_patched_message_from_reader)
+    alltlobjects.tlobjects[CURRENT_MESSAGE_CONSTRUCTOR_ID] = patched_types.Message
+
+
+def read_schedule_repeat_period(message: Any) -> int | None:
+    for attr in ("schedule_repeat_period", "schedulePeriod", "schedule_period"):
+        raw_value = getattr(message, attr, None)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
 PROBE_EMOJIS = ("😀", "😄", "😎", "🥳", "✨", "🔥", "🍀", "🌊", "🎯", "🚀")
 
 
@@ -39,7 +278,8 @@ class TelethonManager:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.config.session_dir.mkdir(parents=True, exist_ok=True)
-        self._supports_repeat = "schedule_repeat_period" in inspect.signature(SendMessageRequest.__init__).parameters
+        install_repeat_support_patch()
+        self._supports_repeat = True
 
     def session_path(self, session_file: str) -> str:
         return str((self.config.session_dir / session_file).resolve())
@@ -251,12 +491,17 @@ class TelethonManager:
         group_row: dict[str, Any],
         message_text: str,
         when: datetime,
+        repeat_period: int | None = None,
     ) -> int:
         client = self.build_client(session_row["session_file"])
         await client.connect()
         try:
             entity = await self._resolve_entity(client, group_row)
             try:
+                if repeat_period and repeat_period > 0:
+                    if not session_row.get("is_premium"):
+                        raise RuntimeError("原生每天重复只支持 Premium 账号")
+                    return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
                 message = await client.send_message(entity, message_text, schedule=when)
             except Exception as exc:
                 error_message = self.describe_error(exc)
@@ -265,6 +510,8 @@ class TelethonManager:
                 joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
                 if not joined:
                     raise RuntimeError(note or error_message)
+                if repeat_period and repeat_period > 0:
+                    return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
                 message = await client.send_message(entity, message_text, schedule=when)
             return int(message.id)
         finally:
@@ -284,6 +531,7 @@ class TelethonManager:
                         "message_id": int(getattr(message, "id", 0)),
                         "text": getattr(message, "message", "") or "",
                         "schedule_at": date_value.isoformat() if date_value else None,
+                        "repeat_period": read_schedule_repeat_period(message),
                     }
                 )
             return items
@@ -446,8 +694,91 @@ class TelethonManager:
             candidate = candidate + "".join(random.choice(letters) for _ in range(5 - len(candidate)))
         return candidate[:32]
 
-    def next_daily_run(self, when: datetime) -> datetime:
-        return when + timedelta(days=1)
+    async def _schedule_native_repeat_message(
+        self,
+        client: TelegramClient,
+        entity: Any,
+        message_text: str,
+        when: datetime,
+        repeat_period: int,
+    ) -> int:
+        before_ids = await self._scheduled_message_ids(client, entity)
+        request = SendMessageWithRepeatRequest(
+            peer=entity,
+            message=message_text,
+            schedule_date=when,
+            schedule_repeat_period=repeat_period,
+        )
+        try:
+            await client(request)
+        except Exception:
+            matched_id = await self._find_new_scheduled_message_id(client, entity, before_ids, message_text, when, repeat_period)
+            if matched_id is not None:
+                return matched_id
+            raise
+        matched_id = await self._find_new_scheduled_message_id(client, entity, before_ids, message_text, when, repeat_period)
+        if matched_id is None:
+            raise RuntimeError("Telegram 没有返回新建的原生重复定时消息")
+        return matched_id
+
+    async def _scheduled_message_ids(self, client: TelegramClient, entity: Any) -> set[int]:
+        result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
+        return {int(getattr(message, "id", 0)) for message in getattr(result, "messages", []) if int(getattr(message, "id", 0) or 0) > 0}
+
+    async def _find_new_scheduled_message_id(
+        self,
+        client: TelegramClient,
+        entity: Any,
+        before_ids: set[int],
+        message_text: str,
+        when: datetime,
+        repeat_period: int | None = None,
+    ) -> int | None:
+        target_text = (message_text or "").strip()
+        target_iso = self._as_utc(when).isoformat()
+        for _ in range(8):
+            await asyncio.sleep(0.35)
+            result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
+            candidates: list[int] = []
+            for message in getattr(result, "messages", []):
+                message_id = int(getattr(message, "id", 0) or 0)
+                if message_id <= 0 or message_id in before_ids:
+                    continue
+                date_value = getattr(message, "date", None)
+                message_iso = self._as_utc(date_value).isoformat() if isinstance(date_value, datetime) else None
+                if target_text and (getattr(message, "message", "") or "").strip() != target_text:
+                    continue
+                if message_iso and message_iso != target_iso:
+                    continue
+                actual_repeat = read_schedule_repeat_period(message)
+                if repeat_period and actual_repeat not in {None, repeat_period}:
+                    continue
+                candidates.append(message_id)
+            if candidates:
+                candidates.sort(reverse=True)
+                return candidates[0]
+        return None
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def next_daily_run(self, when: datetime, reference: datetime | None = None) -> datetime:
+        candidate = self._as_utc(when)
+        reference_value = self._as_utc(reference or datetime.now(timezone.utc))
+        if candidate >= reference_value:
+            return candidate
+        delta = reference_value - candidate
+        candidate += timedelta(days=delta.days)
+        if candidate < reference_value:
+            candidate += timedelta(days=1)
+        return candidate
+
+    @staticmethod
+    def daily_repeat_period() -> int:
+        return TELEGRAM_DAILY_REPEAT_PERIOD
 
     @property
     def supports_repeat(self) -> bool:

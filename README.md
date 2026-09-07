@@ -20,7 +20,7 @@
   - real send-probe result using a temporary random emoji
 - Create scheduled Telegram messages
 - Batch-fill scheduled messages at 5/10/30 minute intervals or a custom minute interval until the Telegram cap
-- Daily repeat support for premium-capable accounts via rolling future scheduling
+- Native Telegram daily repeat support for premium-capable accounts
 - View queued join jobs
 - View saved scheduled tasks
 - View scheduled messages already stored in Telegram for a group
@@ -108,7 +108,7 @@ python main.py
 - Approval-based invite links stay in `awaiting_approval`
 - Join queue retries flood-wait cases automatically
 - Session status is marked offline when the account is no longer authorized
-- Daily repeat depends on the bot process staying online so it can keep scheduling the next occurrence
+- Daily repeat is created as Telegram native repeat tasks, so it does not depend on the bot process staying online
 
 ## Clone URL
 
