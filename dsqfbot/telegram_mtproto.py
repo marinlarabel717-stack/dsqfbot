@@ -907,6 +907,8 @@ class TelethonManager:
         if name in mapping:
             return mapping[name]
         message = str(exc).strip() or name
+        if "Could not find a matching Constructor ID" in message:
+            return "Telegram 返回了当前库暂不兼容的数据，请更新后再重试"
         if "database is locked" in message.lower():
             return "账号本地会话正忙，请稍后重试"
         if "A wait of" in message:

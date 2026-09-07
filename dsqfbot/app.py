@@ -678,7 +678,11 @@ class DsqfBotApp:
                         note += f"\n未能自动生成用户名：{info['username_error']}"
                     await self.render(update, note, self.account_detail_keyboard(session_id))
                 except Exception as exc:
-                    self.db.update_session(session_id, status="offline", last_error=self.telethon.describe_error(exc))
+                    error_message = self.telethon.describe_error(exc)
+                    fields: dict[str, Any] = {"last_error": error_message}
+                    if error_message == "账号掉线":
+                        fields["status"] = "offline"
+                    self.db.update_session(session_id, **fields)
                     await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
                 return
             if data.startswith("account:sync:"):
@@ -702,7 +706,11 @@ class DsqfBotApp:
                     group_count = sum(1 for item in items if not item.get("is_channel"))
                     await self.render(update, f"同步完成，共 {group_count} 个群。频道已自动隐藏。", self.account_detail_keyboard(session_id))
                 except Exception as exc:
-                    self.db.update_session(session_id, status="offline", last_error=self.telethon.describe_error(exc))
+                    error_message = self.telethon.describe_error(exc)
+                    fields: dict[str, Any] = {"last_error": error_message}
+                    if error_message == "账号掉线":
+                        fields["status"] = "offline"
+                    self.db.update_session(session_id, **fields)
                     await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
                 return
             if data.startswith("account:delete:"):
