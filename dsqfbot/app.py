@@ -1089,7 +1089,9 @@ class DsqfBotApp:
         groups = [
             item
             for item in self.db.list_groups(session_id)
-            if item.get("join_status") != "left" and not int(item.get("is_channel") or 0)
+            if item.get("join_status") != "left"
+            and not int(item.get("is_channel") or 0)
+            and item.get("speak_status") != "频道跳过"
         ]
         groups.sort(key=lambda item: int(item.get("id") or 0))
         return groups

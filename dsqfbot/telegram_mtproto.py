@@ -496,7 +496,7 @@ class TelethonManager:
                     if not (dialog.is_group or dialog.is_channel):
                         continue
                     username = getattr(entity, "username", None)
-                    is_channel = not bool(getattr(dialog, "is_group", False))
+                    is_channel = bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False))
                     items.append(
                         {
                             "peer_id": peer_id,
@@ -662,7 +662,7 @@ class TelethonManager:
             await client(DeleteScheduledMessagesRequest(peer=entity, id=ids))
         return len(ids)
 
-    async def detect_group_status(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> dict[str, str]:
+    async def detect_group_status(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> dict[str, Any]:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
@@ -671,7 +671,7 @@ class TelethonManager:
             except errors.UserNotParticipantError:
                 return {"join_status": "not_joined", "speak_status": "未加入群", "last_error": "未加入群"}
             if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
-                return {"join_status": "joined", "speak_status": "频道跳过", "last_error": ""}
+                return {"join_status": "joined", "speak_status": "频道跳过", "last_error": "", "is_channel": 1}
             permissions = await client.get_permissions(entity, "me")
             if getattr(permissions, "is_banned", False):
                 return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
