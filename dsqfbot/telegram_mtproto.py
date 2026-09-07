@@ -269,6 +269,7 @@ def read_schedule_repeat_period(message: Any) -> int | None:
             return value
     return None
 PROBE_EMOJIS = ("😀", "😄", "😎", "🥳", "✨", "🔥", "🍀", "🌊", "🎯", "🚀")
+PROBE_SYMBOLS = (".", "-", "+", "~", "*", "1")
 
 
 @dataclass(slots=True)
@@ -689,20 +690,20 @@ class TelethonManager:
             if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
                 return {"join_status": "joined", "speak_status": "频道跳过", "last_error": "", "is_channel": 1}
             permissions = await client.get_permissions(entity, "me")
-            if getattr(permissions, "is_banned", False):
-                return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
             if getattr(permissions, "has_left", False):
                 return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
-            if getattr(permissions, "send_messages", None) is False:
+            can_send_messages = self._permissions_allow_text_send(permissions)
+            if can_send_messages is False:
                 joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
                 if not joined:
-                    message = note or "无发言权限"
+                    message = note or "禁言"
                     return {"join_status": "joined", "speak_status": message, "last_error": message}
                 permissions = await client.get_permissions(entity, "me")
-                if getattr(permissions, "is_banned", False):
-                    return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
                 if getattr(permissions, "has_left", False):
                     return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
+                can_send_messages = self._permissions_allow_text_send(permissions)
+                if can_send_messages is False:
+                    return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
             probe_ok, probe_error = await self._probe_send_message(client, entity)
             if probe_ok:
                 return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
@@ -744,18 +745,31 @@ class TelethonManager:
         raise errors.UserNotParticipantError(request=None)
 
     async def _probe_send_message(self, client: TelegramClient, entity: Any) -> tuple[bool, str | None]:
-        try:
-            probe_message = await client.send_message(entity, random.choice(PROBE_EMOJIS))
-        except Exception as exc:
-            message = self.describe_error(exc)
-            if message == "账号掉线":
-                raise
-            return False, message
-        try:
-            await client.delete_messages(entity, [probe_message.id])
-        except Exception:
-            pass
-        return True, None
+        last_error: str | None = None
+        for probe_text in (random.choice(PROBE_EMOJIS), random.choice(PROBE_SYMBOLS)):
+            try:
+                probe_message = await client.send_message(entity, probe_text)
+            except Exception as exc:
+                message = self.describe_error(exc)
+                if message == "账号掉线":
+                    raise
+                last_error = message
+                continue
+            try:
+                await client.delete_messages(entity, [probe_message.id])
+            except Exception:
+                pass
+            return True, None
+        return False, last_error
+
+    @staticmethod
+    def _permissions_allow_text_send(permissions: Any) -> bool | None:
+        send_messages = getattr(permissions, "send_messages", None)
+        if send_messages is False:
+            return False
+        if send_messages is True:
+            return True
+        return None
 
     async def _auto_join_linked_channel_for_speaking(self, client: TelegramClient, entity: Any) -> tuple[bool, str | None]:
         if not (getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False)):
