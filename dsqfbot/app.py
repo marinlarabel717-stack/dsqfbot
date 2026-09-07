@@ -290,8 +290,12 @@ class DsqfBotApp:
             for source_path in session_paths:
                 session_file = self.ensure_unique_session_file(source_path.stem, used_files)
                 target_path = self.telethon.session_sqlite_path(session_file)
+                metadata_source_path = source_path.with_suffix(".json")
+                metadata_target_path = self.telethon.session_metadata_path(session_file)
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source_path, target_path)
+                if metadata_source_path.is_file():
+                    shutil.copy2(metadata_source_path, metadata_target_path)
                 try:
                     info = await self.telethon.inspect_session(session_file)
                     label = self.ensure_unique_label(info["label"], used_labels)

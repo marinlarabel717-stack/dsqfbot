@@ -6,7 +6,7 @@
 
 - Button-only bot UI, no slash-command workflow required
 - Add and verify multiple Telegram user sessions through the bot
-- Import one or more existing `.session` files from a zip archive
+- Import one or more existing `.session` files from a zip archive, including matching `.json` metadata when present
 - Sync group/channel lists for each session
 - Batch import `t.me` links and enqueue join jobs
 - Smart join intervals to reduce aggressive join bursts
@@ -81,7 +81,7 @@ Notes:
 - `ADMIN_IDS`: allowed Telegram user IDs, comma-separated
 - `API_ID` and `API_HASH`: Telegram app credentials for Telethon
 - `DATABASE_PATH`: SQLite database path
-- `SESSION_DIR`: folder for user session files
+- `SESSION_DIR`: folder for user session files and imported sidecar metadata
 - `CLIENT_*`: explicit client fingerprint sent during login instead of relying on Telethon defaults
 
 ## Run
@@ -95,12 +95,13 @@ python main.py
 1. Send any message to the bot
 2. Open `账号管理`
 3. Add one or more user accounts, or upload a zip containing `.session` files
-4. Open `批量加群`
-5. Select sessions and distribution mode
-6. Paste group links
-7. Select the join interval button
-8. Sync groups or open a group detail page
-9. Create a scheduled message from the group detail page
+4. If the zip also includes same-name `.json` files, their `app_id / app_hash / device / app_version` metadata is preserved per account
+5. Open `批量加群`
+6. Select sessions and distribution mode
+7. Paste group links
+8. Select the join interval button
+9. Sync groups or open a group detail page
+10. Create a scheduled message from the group detail page
 
 ## Current Behavior
 

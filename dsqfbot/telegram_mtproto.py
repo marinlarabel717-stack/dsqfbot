@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -291,16 +292,47 @@ class TelethonManager:
     def session_sqlite_path(self, session_file: str) -> Path:
         return Path(self.session_path(session_file)).with_suffix(".session")
 
+    def session_metadata_path(self, session_file: str) -> Path:
+        return Path(self.session_path(session_file)).with_suffix(".json")
+
+    def load_session_metadata(self, session_file: str) -> dict[str, Any]:
+        metadata_path = self.session_metadata_path(session_file)
+        if not metadata_path.is_file():
+            return {}
+        try:
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            LOGGER.warning("failed to read session metadata for %s: %s", session_file, exc)
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def build_client(self, session_file: str) -> TelegramClient:
+        metadata = self.load_session_metadata(session_file)
+        raw_api_id = metadata.get("app_id")
+        try:
+            api_id = int(raw_api_id)
+        except (TypeError, ValueError):
+            api_id = self.config.api_id
+        if api_id <= 0:
+            api_id = self.config.api_id
+        api_hash = str(metadata.get("app_hash") or self.config.api_hash or "").strip()
+        device_model = str(metadata.get("device") or self.config.client_device_model or "DSQFBot").strip() or "DSQFBot"
+        system_version = str(metadata.get("sdk") or self.config.client_system_version or "Linux").strip() or "Linux"
+        app_version = str(metadata.get("app_version") or self.config.client_app_version or "1.0").strip() or "1.0"
+        lang_code = str(metadata.get("lang_pack") or self.config.client_lang_code or "zh-hans").strip() or "zh-hans"
+        system_lang_code = str(
+            metadata.get("system_lang_pack") or self.config.client_system_lang_code or "zh-hans"
+        ).strip() or "zh-hans"
         return TelegramClient(
             self.session_path(session_file),
-            self.config.api_id,
-            self.config.api_hash,
-            device_model=self.config.client_device_model,
-            system_version=self.config.client_system_version,
-            app_version=self.config.client_app_version,
-            lang_code=self.config.client_lang_code,
-            system_lang_code=self.config.client_system_lang_code,
+            api_id,
+            api_hash,
+            device_model=device_model,
+            system_version=system_version,
+            app_version=app_version,
+            lang_code=lang_code,
+            system_lang_code=system_lang_code,
         )
 
     def _get_session_lock(self, session_file: str) -> asyncio.Lock:
@@ -322,7 +354,12 @@ class TelethonManager:
 
     def delete_session_files(self, session_file: str) -> None:
         base_path = Path(self.session_path(session_file))
-        candidates = [base_path, self.session_sqlite_path(session_file), self.session_sqlite_path(session_file).with_suffix(".session-journal")]
+        candidates = [
+            base_path,
+            self.session_sqlite_path(session_file),
+            self.session_sqlite_path(session_file).with_suffix(".session-journal"),
+            self.session_metadata_path(session_file),
+        ]
         for item in candidates:
             try:
                 if item.exists():
@@ -331,17 +368,24 @@ class TelethonManager:
                 continue
 
     async def inspect_session(self, session_file: str) -> dict[str, Any]:
+        metadata = self.load_session_metadata(session_file)
         async with self.locked_client(session_file) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             me = await client.get_me()
             label = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip()
             phone = getattr(me, "phone", None)
+            if not label:
+                label = " ".join(
+                    part for part in [metadata.get("first_name", ""), metadata.get("last_name", "")] if str(part).strip()
+                ).strip()
+            if not phone:
+                phone = metadata.get("phone")
             return {
                 "label": label or session_file,
-                "phone": f"+{phone}" if phone else "-",
-                "is_premium": bool(getattr(me, "premium", False)),
-                "username": getattr(me, "username", None),
+                "phone": f"+{phone}" if phone and not str(phone).startswith("+") else (str(phone) if phone else "-"),
+                "is_premium": bool(getattr(me, "premium", metadata.get("is_premium", False))),
+                "username": getattr(me, "username", None) or metadata.get("username"),
             }
 
     async def begin_login(self, label: str, phone: str) -> tuple[str, str]:
