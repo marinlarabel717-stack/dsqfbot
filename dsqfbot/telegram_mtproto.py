@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, errors, functions
-from telethon.errors.common import TypeNotFoundError
 from telethon.tl import alltlobjects, patched as patched_types, types
 from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import (
@@ -402,7 +401,7 @@ class TelethonManager:
         offset_date: datetime | None = None
         offset_id = 0
         offset_peer: Any = types.InputPeerEmpty()
-        ignore_pinned = False
+        ignore_pinned = True
         batch_size = 50
 
         while True:
@@ -419,20 +418,28 @@ class TelethonManager:
                         folder=0,
                     )
                 ]
-            except TypeNotFoundError as exc:
+            except Exception as exc:
                 if batch_size > 1:
                     batch_size = max(1, batch_size // 2)
-                    LOGGER.warning("dialog batch parse failed, retrying with smaller batch size=%s: %s", batch_size, exc)
+                    LOGGER.warning(
+                        "dialog batch fetch failed (%s), retrying with smaller batch size=%s: %s",
+                        exc.__class__.__name__,
+                        batch_size,
+                        exc,
+                    )
                     continue
                 if items:
-                    LOGGER.warning("dialog parse failed after partial sync, returning collected groups: %s", exc)
+                    LOGGER.warning(
+                        "dialog fetch failed after partial sync (%s), returning collected groups: %s",
+                        exc.__class__.__name__,
+                        exc,
+                    )
                     return items
                 raise RuntimeError("同步群组时遇到 Telegram 异常对话，请稍后重试")
 
             if not dialogs:
                 return items
 
-            ignore_pinned = True
             for dialog in dialogs:
                 try:
                     entity = dialog.entity
