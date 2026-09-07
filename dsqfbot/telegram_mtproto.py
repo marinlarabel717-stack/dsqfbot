@@ -568,18 +568,21 @@ class TelethonManager:
                 return {"join_status": "not_joined", "speak_status": probe_error, "last_error": probe_error}
             return {"join_status": "joined", "speak_status": probe_error or "无发言权限", "last_error": probe_error or "无发言权限"}
 
-    async def leave_group(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> None:
+    async def leave_group(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> bool:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             entity = await self._resolve_entity(client, group_row)
+            if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
+                return False
             try:
-                if getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False):
+                if getattr(entity, "megagroup", False):
                     await client(functions.channels.LeaveChannelRequest(entity))
                 else:
                     await client.delete_dialog(entity)
             except Exception:
                 await client.delete_dialog(entity)
+            return True
 
     async def _resolve_entity(self, client: TelegramClient, group_row: dict[str, Any]):
         if group_row.get("username"):

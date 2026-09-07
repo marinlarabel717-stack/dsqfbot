@@ -741,10 +741,14 @@ class DsqfBotApp:
                         result = await self.telethon.detect_group_status(session_row, group_row)
                         self.db.update_group(group_row["id"], **result)
                         if result.get("join_status") == "joined" and result.get("speak_status") != "正常可发":
-                            await self.telethon.leave_group(session_row, group_row)
-                            self.db.update_group(group_row["id"], join_status="left", speak_status="已退出", last_error="")
-                            left_count += 1
-                            current_action = f"已退出 | {result.get('speak_status') or '无法发送'}"
+                            left_group = await self.telethon.leave_group(session_row, group_row)
+                            if left_group:
+                                self.db.update_group(group_row["id"], join_status="left", speak_status="已退出", last_error="")
+                                left_count += 1
+                                current_action = f"已退出 | {result.get('speak_status') or '无法发送'}"
+                            else:
+                                skipped += 1
+                                current_action = f"跳过频道 | {result.get('speak_status') or '无法发送'}"
                         else:
                             skipped += 1
                             current_action = f"跳过 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
