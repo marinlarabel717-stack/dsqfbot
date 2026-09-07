@@ -538,6 +538,8 @@ class TelethonManager:
                 entity = await self._resolve_entity(client, group_row)
             except errors.UserNotParticipantError:
                 return {"join_status": "not_joined", "speak_status": "未加入群", "last_error": "未加入群"}
+            if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
+                return {"join_status": "joined", "speak_status": "频道跳过", "last_error": ""}
             permissions = await client.get_permissions(entity, "me")
             if getattr(permissions, "is_banned", False):
                 return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
