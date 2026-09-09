@@ -299,6 +299,26 @@ class TelethonManager:
     def session_metadata_path(self, session_file: str) -> Path:
         return Path(self.session_path(session_file)).with_suffix(".json")
 
+    @staticmethod
+    def _format_restriction_reason(reasons: Any) -> str:
+        parts: list[str] = []
+        for item in reasons or []:
+            reason = str(getattr(item, "reason", "") or "").strip()
+            text = str(getattr(item, "text", "") or "").strip()
+            for value in (text, reason):
+                if value and value not in parts:
+                    parts.append(value)
+        return "；".join(parts[:2])
+
+    def classify_account_status(self, me: Any) -> tuple[str, str]:
+        if getattr(me, "deleted", False):
+            return "frozen", "账号已冻结"
+        restricted = bool(getattr(me, "restricted", False))
+        reason_text = self._format_restriction_reason(getattr(me, "restriction_reason", None))
+        if restricted or reason_text:
+            return "frozen", reason_text or "账号已冻结"
+        return "online", ""
+
     def load_session_metadata(self, session_file: str) -> dict[str, Any]:
         metadata_path = self.session_metadata_path(session_file)
         if not metadata_path.is_file():
@@ -377,6 +397,7 @@ class TelethonManager:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             me = await client.get_me()
+            status, last_error = self.classify_account_status(me)
             label = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip()
             phone = getattr(me, "phone", None)
             if not label:
@@ -390,6 +411,8 @@ class TelethonManager:
                 "phone": f"+{phone}" if phone and not str(phone).startswith("+") else (str(phone) if phone else "-"),
                 "is_premium": bool(getattr(me, "premium", metadata.get("is_premium", False))),
                 "username": getattr(me, "username", None) or metadata.get("username"),
+                "status": status,
+                "last_error": last_error,
             }
 
     async def begin_login(self, label: str, phone: str) -> tuple[str, str]:
@@ -431,10 +454,11 @@ class TelethonManager:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             me = await client.get_me()
+            status, last_error = self.classify_account_status(me)
             username = getattr(me, "username", None)
             username_set = False
             username_error = None
-            if auto_set_username and not username:
+            if status == "online" and auto_set_username and not username:
                 username, username_set, username_error = await self._ensure_random_username(
                     client,
                     me,
@@ -446,12 +470,18 @@ class TelethonManager:
                 "username": username,
                 "username_set": username_set,
                 "username_error": username_error,
+                "status": status,
+                "last_error": last_error,
             }
 
     async def list_groups(self, session_row: dict[str, Any]) -> dict[str, Any]:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
+            me = await client.get_me()
+            status, last_error = self.classify_account_status(me)
+            if status != "online":
+                raise RuntimeError(last_error or "账号已冻结")
             return await self._list_groups_resilient(client)
 
     async def _list_groups_resilient(self, client: TelegramClient) -> dict[str, Any]:
@@ -1054,6 +1084,11 @@ class TelethonManager:
             "ChannelPrivateError": "群不可访问",
             "AuthKeyUnregisteredError": "账号掉线",
             "SessionRevokedError": "账号掉线",
+            "UserDeactivatedBanError": "账号已冻结",
+            "UserDeactivatedError": "账号已冻结",
+            "InputUserDeactivatedError": "账号已冻结",
+            "PhoneNumberBannedError": "账号已冻结",
+            "FrozenMethodInvalidError": "账号已冻结",
         }
         name = exc.__class__.__name__
         if name in mapping:

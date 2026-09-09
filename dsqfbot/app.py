@@ -289,10 +289,19 @@ class DsqfBotApp:
                         phone=info["phone"],
                         session_file=session_file,
                         is_premium=info["is_premium"],
-                        status="online",
+                        status=info.get("status", "online"),
+                        last_error=info.get("last_error", ""),
                     )
                     session_row = self.db.get_session(session_id)
                     verify_info = await self.telethon.verify_session(session_row, auto_set_username=True) if session_row else None
+                    if session_row and verify_info:
+                        self.db.update_session(
+                            session_id,
+                            status=verify_info.get("status", info.get("status", "online")),
+                            is_premium=int(verify_info["is_premium"]),
+                            label=label,
+                            last_error=verify_info.get("last_error", info.get("last_error", "")),
+                        )
                     imported.append(
                         {
                             "id": session_id,
@@ -662,7 +671,13 @@ class DsqfBotApp:
                     return
                 try:
                     info = await self.telethon.verify_session(session_row, auto_set_username=True)
-                    self.db.update_session(session_id, status="online", is_premium=int(info["is_premium"]), label=info["label"], last_error="")
+                    self.db.update_session(
+                        session_id,
+                        status=info.get("status", "online"),
+                        is_premium=int(info["is_premium"]),
+                        label=info["label"],
+                        last_error=info.get("last_error", ""),
+                    )
                     note = "账号状态已刷新。"
                     if info.get("username_set") and info.get("username"):
                         note += f"\n已自动生成用户名：@{info['username']}"
@@ -674,6 +689,8 @@ class DsqfBotApp:
                     fields: dict[str, Any] = {"last_error": error_message}
                     if error_message == "账号掉线":
                         fields["status"] = "offline"
+                    elif error_message == "账号已冻结":
+                        fields["status"] = "frozen"
                     self.db.update_session(session_id, **fields)
                     await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
                 return
@@ -702,7 +719,11 @@ class DsqfBotApp:
                     removed_count = 0
                     if not is_partial:
                         removed_count = self.db.mark_missing_groups_left(session_id, active_peer_ids)
-                    self.db.update_session(session_id, status="online", last_error="")
+                    self.db.update_session(
+                        session_id,
+                        status=sync_result.get("status", "online"),
+                        last_error=sync_result.get("last_error", ""),
+                    )
                     group_count = sum(1 for item in items if not item.get("is_channel"))
                     if is_partial:
                         sync_note = f"同步完成（部分），本次扫到 {group_count} 个群。由于 Telegram 对话异常，暂未清理旧记录。"
@@ -717,6 +738,8 @@ class DsqfBotApp:
                     fields: dict[str, Any] = {"last_error": error_message}
                     if error_message == "账号掉线":
                         fields["status"] = "offline"
+                    elif error_message == "账号已冻结":
+                        fields["status"] = "frozen"
                     self.db.update_session(session_id, **fields)
                     await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
                 return
@@ -798,6 +821,8 @@ class DsqfBotApp:
                         self.db.update_group(group_row["id"], last_error=message)
                         if message == "账号掉线":
                             self.db.update_session(session_id, status="offline", last_error=message)
+                        elif message == "账号已冻结":
+                            self.db.update_session(session_id, status="frozen", last_error=message)
                         failed += 1
                         current_action = f"失败 | {message}"
                     if checked in {1, len(groups)} or checked % 3 == 0:
@@ -1402,6 +1427,8 @@ class DsqfBotApp:
                 self.db.update_group(group_row["id"], speak_status=message, last_error=message)
                 if message == "账号掉线":
                     self.db.update_session(session_row["id"], status="offline", last_error=message)
+                elif message == "账号已冻结":
+                    self.db.update_session(session_row["id"], status="frozen", last_error=message)
                 failed += 1
                 current_action = f"失败 | {message}"
 
@@ -1728,6 +1755,7 @@ class DsqfBotApp:
         return {
             "online": "在线",
             "offline": "掉线",
+            "frozen": "冻结",
             "pending": "待登录",
         }.get(status, status)
 
@@ -1820,7 +1848,11 @@ class DsqfBotApp:
                         await self.refresh_join_batch_message(int(batch_id))
                 else:
                     self.db.finish_join_job(job["id"], "failed", last_error=message)
-                    self.db.update_session(session_row["id"], status="offline" if message == "账号掉线" else session_row["status"], last_error=message)
+                    self.db.update_session(
+                        session_row["id"],
+                        status="offline" if message == "账号掉线" else "frozen" if message == "账号已冻结" else session_row["status"],
+                        last_error=message,
+                    )
                     if batch_id:
                         await self.refresh_join_batch_message(int(batch_id))
             await asyncio.sleep(1)
