@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, errors, functions
 from telethon.tl import alltlobjects, patched as patched_types, types
@@ -757,27 +758,23 @@ class TelethonManager:
                 return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
             can_send_messages = self._permissions_allow_text_send(permissions)
             if can_send_messages is False:
-                joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
-                if not joined:
-                    message = note or "禁言"
-                    return {"join_status": "joined", "speak_status": message, "last_error": message}
-                permissions = await client.get_permissions(entity, "me")
-                if getattr(permissions, "has_left", False):
-                    return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
-                can_send_messages = self._permissions_allow_text_send(permissions)
-                if can_send_messages is False:
-                    return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
+                linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
+                if linked_required:
+                    return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
+                mute_result = await self._classify_muted_group(client, entity, permissions)
+                if mute_result:
+                    return mute_result
             probe_ok, probe_error = await self._probe_send_message(client, entity)
             if probe_ok:
                 return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
-            if probe_error == "无发言权限":
-                joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
-                if joined:
-                    probe_ok, probe_error = await self._probe_send_message(client, entity)
-                    if probe_ok:
-                        return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
-                elif note:
-                    probe_error = note
+            if probe_error in {"无发言权限", "禁言"}:
+                linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
+                if linked_required:
+                    return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
+                permissions = await client.get_permissions(entity, "me")
+                mute_result = await self._classify_muted_group(client, entity, permissions)
+                if mute_result:
+                    return mute_result
             if probe_error == "未加入群":
                 return {"join_status": "not_joined", "speak_status": probe_error, "last_error": probe_error}
             return {"join_status": "joined", "speak_status": probe_error or "无发言权限", "last_error": probe_error or "无发言权限"}
@@ -787,16 +784,7 @@ class TelethonManager:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
             entity = await self._resolve_entity(client, group_row)
-            if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
-                return False
-            try:
-                if getattr(entity, "megagroup", False):
-                    await client(functions.channels.LeaveChannelRequest(entity))
-                else:
-                    await client.delete_dialog(entity)
-            except Exception:
-                await client.delete_dialog(entity)
-            return True
+            return await self._leave_entity(client, entity)
 
     async def _resolve_entity(self, client: TelegramClient, group_row: dict[str, Any]):
         if group_row.get("username"):
@@ -827,23 +815,45 @@ class TelethonManager:
 
     @staticmethod
     def _permissions_allow_text_send(permissions: Any) -> bool | None:
-        send_messages = getattr(permissions, "send_messages", None)
-        if send_messages is False:
+        if getattr(permissions, "has_left", False):
             return False
-        if send_messages is True:
+        if getattr(permissions, "is_admin", False) or getattr(permissions, "is_creator", False) or getattr(permissions, "has_default_permissions", False):
             return True
-        return None
+        banned_rights = getattr(getattr(permissions, "participant", None), "banned_rights", None)
+        if banned_rights is None:
+            return None
+        if bool(getattr(banned_rights, "view_messages", False)):
+            return False
+        if bool(getattr(banned_rights, "send_messages", False) or getattr(banned_rights, "send_plain", False)):
+            return False
+        return True
 
-    async def _auto_join_linked_channel_for_speaking(self, client: TelegramClient, entity: Any) -> tuple[bool, str | None]:
-        if not (getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False)):
+    async def _linked_channel_requirement_note(self, client: TelegramClient, entity: Any) -> tuple[bool, str | None]:
+        linked_entity, title = await self._linked_channel_entity(client, entity)
+        if linked_entity is None:
             return False, None
+        try:
+            permissions = await client.get_permissions(linked_entity, "me")
+        except errors.UserNotParticipantError:
+            return True, f"需订阅频道：{title}"
+        except errors.ChannelPrivateError:
+            return True, f"需订阅频道：{title}"
+        except Exception:
+            return False, None
+        if permissions and not getattr(permissions, "has_left", False):
+            return False, None
+        return True, f"需订阅频道：{title}"
+
+    async def _linked_channel_entity(self, client: TelegramClient, entity: Any) -> tuple[Any | None, str | None]:
+        if not (getattr(entity, "megagroup", False) or getattr(entity, "broadcast", False)):
+            return None, None
         try:
             full = await client(GetFullChannelRequest(entity))
         except Exception:
-            return False, None
+            return None, None
         linked_chat_id = int(getattr(getattr(full, "full_chat", None), "linked_chat_id", 0) or 0)
         if linked_chat_id <= 0:
-            return False, None
+            return None, None
         linked_entity = None
         for chat in getattr(full, "chats", []) or []:
             if int(getattr(chat, "id", 0) or 0) == linked_chat_id:
@@ -852,9 +862,65 @@ class TelethonManager:
         if linked_entity is None:
             try:
                 linked_entity = await client.get_entity(linked_chat_id)
-            except Exception as exc:
-                return False, f"关联频道解析失败：{self.describe_error(exc)}"
+            except Exception:
+                return None, None
         title = getattr(linked_entity, "title", None) or getattr(linked_entity, "username", None) or str(linked_chat_id)
+        return linked_entity, title
+
+    async def _classify_muted_group(self, client: TelegramClient, entity: Any, permissions: Any) -> dict[str, Any] | None:
+        banned_rights = getattr(getattr(permissions, "participant", None), "banned_rights", None)
+        if banned_rights is None:
+            return None
+        if not bool(getattr(banned_rights, "send_messages", False) or getattr(banned_rights, "send_plain", False)):
+            return None
+        until_date = getattr(banned_rights, "until_date", None)
+        if self._is_forever_restriction(until_date):
+            left = await self._leave_entity(client, entity)
+            detail = "永久禁言，已退群" if left else "永久禁言"
+            last_error = detail if left else "永久禁言，退群失败"
+            return {"join_status": "left" if left else "joined", "speak_status": detail, "last_error": last_error}
+        until_text = self._format_restriction_until(until_date)
+        if until_text:
+            detail = f"禁言至 {until_text}"
+            return {"join_status": "joined", "speak_status": detail, "last_error": detail}
+        return {"join_status": "joined", "speak_status": "禁言", "last_error": "禁言"}
+
+    async def _leave_entity(self, client: TelegramClient, entity: Any) -> bool:
+        if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
+            return False
+        try:
+            if getattr(entity, "megagroup", False):
+                await client(functions.channels.LeaveChannelRequest(entity))
+            else:
+                await client.delete_dialog(entity)
+        except Exception:
+            await client.delete_dialog(entity)
+        return True
+
+    @staticmethod
+    def _is_forever_restriction(until_date: datetime | None) -> bool:
+        if until_date is None:
+            return True
+        if until_date.tzinfo is None:
+            until_date = until_date.replace(tzinfo=timezone.utc)
+        # Telegram uses far-future timestamps to represent "forever" restrictions.
+        if until_date.year >= 2099:
+            return True
+        now = datetime.now(timezone.utc)
+        return until_date <= datetime(1971, 1, 1, tzinfo=timezone.utc) or (until_date - now) >= timedelta(days=365)
+
+    def _format_restriction_until(self, until_date: datetime | None) -> str | None:
+        if until_date is None:
+            return None
+        value = until_date
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(ZoneInfo(self.config.default_timezone)).strftime("%Y-%m-%d %H:%M")
+
+    async def _auto_join_linked_channel_for_speaking(self, client: TelegramClient, entity: Any) -> tuple[bool, str | None]:
+        linked_entity, title = await self._linked_channel_entity(client, entity)
+        if linked_entity is None:
+            return False, None
         try:
             await client(JoinChannelRequest(linked_entity))
             return True, f"已自动关注关联频道：{title}"
