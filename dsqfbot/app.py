@@ -1374,9 +1374,13 @@ class DsqfBotApp:
         first_when: datetime,
         interval_minutes: int,
         repeat_mode: str,
+        client: Any | None = None,
         progress_callback: Callable[[int, int, datetime], Awaitable[None]] | None = None,
     ) -> tuple[list[int], int]:
-        existing = await self.telethon.list_scheduled_messages(session_row, group_row)
+        if client is None:
+            existing = await self.telethon.list_scheduled_messages(session_row, group_row)
+        else:
+            existing = await self.telethon.list_scheduled_messages_with_client(client, group_row)
         remaining = max(TELEGRAM_SCHEDULE_LIMIT - len(existing), 0)
         if remaining <= 0:
             raise RuntimeError("这个群的 Telegram 已设定时已经到上限了")
@@ -1385,13 +1389,23 @@ class DsqfBotApp:
         daily_repeat = self.is_daily_repeat_mode(repeat_mode)
         for offset in range(remaining):
             when = first_when + timedelta(minutes=interval_minutes * offset)
-            message_id = await self.telethon.schedule_message(
-                session_row,
-                group_row,
-                message_text,
-                when,
-                repeat_period=self.telethon.daily_repeat_period() if daily_repeat else None,
-            )
+            if client is None:
+                message_id = await self.telethon.schedule_message(
+                    session_row,
+                    group_row,
+                    message_text,
+                    when,
+                    repeat_period=self.telethon.daily_repeat_period() if daily_repeat else None,
+                )
+            else:
+                message_id = await self.telethon.schedule_message_with_client(
+                    client,
+                    session_row,
+                    group_row,
+                    message_text,
+                    when,
+                    repeat_period=self.telethon.daily_repeat_period() if daily_repeat else None,
+                )
             task_id = self.db.create_task(
                 session_id=session_row["id"],
                 group_id=group_row["id"],
@@ -1468,103 +1482,106 @@ class DsqfBotApp:
         created_tasks = 0
         last_scheduled_at = when
 
-        for group_row in groups:
-            checked += 1
-            current_title = group_row["title"]
-            current_action = "正在检查可发送状态..."
-            try:
-                result = await self.telethon.detect_group_status(session_row, group_row)
-                self.db.update_group(group_row["id"], **result)
-                if result.get("join_status") != "joined" or result.get("speak_status") != "正常可发":
-                    skipped += 1
-                    current_action = f"跳过 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
-                elif interval_minutes is not None:
-                    base_created_tasks = created_tasks
+        async with self.telethon.locked_client(session_row["session_file"]) as client:
+            for group_row in groups:
+                checked += 1
+                current_title = group_row["title"]
+                current_action = "正在检查可发送状态..."
+                try:
+                    result = await self.telethon.detect_group_status_with_client(client, group_row)
+                    self.db.update_group(group_row["id"], **result)
+                    if result.get("join_status") != "joined" or result.get("speak_status") != "正常可发":
+                        skipped += 1
+                        current_action = f"跳过 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
+                    elif interval_minutes is not None:
+                        base_created_tasks = created_tasks
 
-                    async def report_group_progress(created: int, total: int, current_when: datetime) -> None:
-                        nonlocal created_tasks, last_scheduled_at
-                        created_tasks = base_created_tasks + created
-                        last_scheduled_at = current_when
-                        if created not in {1, total} and created % 5 != 0:
-                            return
-                        await update_progress_text(
-                            self.sendable_groups_schedule_progress_text(
-                                checked=checked,
-                                total=len(groups),
-                                scheduled_groups=scheduled_groups,
-                                skipped=skipped,
-                                failed=failed,
-                                created_tasks=created_tasks,
-                                current_group=current_title,
-                                current_action=(
-                                    f"正在创建 {created}/{total} 条 | "
-                                    f"排到 {format_dt(current_when.isoformat(), self.config.default_timezone)}"
+                        async def report_group_progress(created: int, total: int, current_when: datetime) -> None:
+                            nonlocal created_tasks, last_scheduled_at
+                            created_tasks = base_created_tasks + created
+                            last_scheduled_at = current_when
+                            if created not in {1, total} and created % 5 != 0:
+                                return
+                            await update_progress_text(
+                                self.sendable_groups_schedule_progress_text(
+                                    checked=checked,
+                                    total=len(groups),
+                                    scheduled_groups=scheduled_groups,
+                                    skipped=skipped,
+                                    failed=failed,
+                                    created_tasks=created_tasks,
+                                    current_group=current_title,
+                                    current_action=(
+                                        f"正在创建 {created}/{total} 条 | "
+                                        f"排到 {format_dt(current_when.isoformat(), self.config.default_timezone)}"
+                                    ),
                                 ),
-                            ),
-                            self.state_cancel_keyboard(),
+                                self.state_cancel_keyboard(),
+                            )
+
+                        task_ids, _ = await self.create_interval_schedule_batch(
+                            session_row=session_row,
+                            group_row=group_row,
+                            message_text=payload["message_text"],
+                            first_when=when,
+                            interval_minutes=interval_minutes,
+                            repeat_mode=repeat_mode,
+                            client=client,
+                            progress_callback=report_group_progress,
                         )
+                        created_tasks = base_created_tasks + len(task_ids)
+                        scheduled_groups += 1
+                        if task_ids:
+                            last_scheduled_at = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
+                        current_action = f"已创建 {len(task_ids)} 条"
+                    else:
+                        message_id = await self.telethon.schedule_message_with_client(
+                            client,
+                            session_row,
+                            group_row,
+                            payload["message_text"],
+                            when,
+                            repeat_period=self.telethon.daily_repeat_period() if daily_repeat else None,
+                        )
+                        task_id = self.db.create_task(
+                            session_id=session_row["id"],
+                            group_id=group_row["id"],
+                            message_text=payload["message_text"],
+                            schedule_at=when.isoformat(),
+                            repeat_mode=repeat_mode,
+                            next_run_at=when.isoformat() if daily_repeat else None,
+                            last_scheduled_for=when.isoformat(),
+                            last_telegram_message_id=message_id,
+                            status="scheduled",
+                        )
+                        created_tasks += 1
+                        scheduled_groups += 1
+                        last_scheduled_at = when
+                        current_action = f"已创建任务 {task_id}"
+                except Exception as exc:
+                    message = self.telethon.describe_error(exc)
+                    self.db.update_group(group_row["id"], speak_status=message, last_error=message)
+                    if message == "账号掉线":
+                        self.db.update_session(session_row["id"], status="offline", last_error=message)
+                    elif message == "账号已冻结":
+                        self.db.update_session(session_row["id"], status="frozen", last_error=message)
+                    failed += 1
+                    current_action = f"失败 | {message}"
 
-                    task_ids, _ = await self.create_interval_schedule_batch(
-                        session_row=session_row,
-                        group_row=group_row,
-                        message_text=payload["message_text"],
-                        first_when=when,
-                        interval_minutes=interval_minutes,
-                        repeat_mode=repeat_mode,
-                        progress_callback=report_group_progress,
+                if checked in {1, len(groups)} or checked % 2 == 0:
+                    await update_progress_text(
+                        self.sendable_groups_schedule_progress_text(
+                            checked=checked,
+                            total=len(groups),
+                            scheduled_groups=scheduled_groups,
+                            skipped=skipped,
+                            failed=failed,
+                            created_tasks=created_tasks,
+                            current_group=current_title,
+                            current_action=current_action,
+                        ),
+                        self.state_cancel_keyboard(),
                     )
-                    created_tasks = base_created_tasks + len(task_ids)
-                    scheduled_groups += 1
-                    if task_ids:
-                        last_scheduled_at = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
-                    current_action = f"已创建 {len(task_ids)} 条"
-                else:
-                    message_id = await self.telethon.schedule_message(
-                        session_row,
-                        group_row,
-                        payload["message_text"],
-                        when,
-                        repeat_period=self.telethon.daily_repeat_period() if daily_repeat else None,
-                    )
-                    task_id = self.db.create_task(
-                        session_id=session_row["id"],
-                        group_id=group_row["id"],
-                        message_text=payload["message_text"],
-                        schedule_at=when.isoformat(),
-                        repeat_mode=repeat_mode,
-                        next_run_at=when.isoformat() if daily_repeat else None,
-                        last_scheduled_for=when.isoformat(),
-                        last_telegram_message_id=message_id,
-                        status="scheduled",
-                    )
-                    created_tasks += 1
-                    scheduled_groups += 1
-                    last_scheduled_at = when
-                    current_action = f"已创建任务 {task_id}"
-            except Exception as exc:
-                message = self.telethon.describe_error(exc)
-                self.db.update_group(group_row["id"], speak_status=message, last_error=message)
-                if message == "账号掉线":
-                    self.db.update_session(session_row["id"], status="offline", last_error=message)
-                elif message == "账号已冻结":
-                    self.db.update_session(session_row["id"], status="frozen", last_error=message)
-                failed += 1
-                current_action = f"失败 | {message}"
-
-            if checked in {1, len(groups)} or checked % 2 == 0:
-                await update_progress_text(
-                    self.sendable_groups_schedule_progress_text(
-                        checked=checked,
-                        total=len(groups),
-                        scheduled_groups=scheduled_groups,
-                        skipped=skipped,
-                        failed=failed,
-                        created_tasks=created_tasks,
-                        current_group=current_title,
-                        current_action=current_action,
-                    ),
-                    self.state_cancel_keyboard(),
-                )
 
         final_lines = [
             "批量定时创建完成",

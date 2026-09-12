@@ -693,41 +693,55 @@ class TelethonManager:
         repeat_period: int | None = None,
     ) -> int:
         async with self.locked_client(session_row["session_file"]) as client:
-            entity = await self._resolve_entity(client, group_row)
-            try:
-                if repeat_period and repeat_period > 0:
-                    if not session_row.get("is_premium"):
-                        raise RuntimeError("原生每天重复只支持 Premium 账号")
-                    return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
-                message = await client.send_message(entity, message_text, schedule=when)
-            except Exception as exc:
-                error_message = self.describe_error(exc)
-                if error_message != "无发言权限":
-                    raise
-                joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
-                if not joined:
-                    raise RuntimeError(note or error_message)
-                if repeat_period and repeat_period > 0:
-                    return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
-                message = await client.send_message(entity, message_text, schedule=when)
-            return int(message.id)
+            return await self.schedule_message_with_client(client, session_row, group_row, message_text, when, repeat_period=repeat_period)
+
+    async def schedule_message_with_client(
+        self,
+        client: TelegramClient,
+        session_row: dict[str, Any],
+        group_row: dict[str, Any],
+        message_text: str,
+        when: datetime,
+        repeat_period: int | None = None,
+    ) -> int:
+        entity = await self._resolve_entity(client, group_row)
+        try:
+            if repeat_period and repeat_period > 0:
+                if not session_row.get("is_premium"):
+                    raise RuntimeError("原生每天重复只支持 Premium 账号")
+                return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
+            message = await client.send_message(entity, message_text, schedule=when)
+        except Exception as exc:
+            error_message = self.describe_error(exc)
+            if error_message != "无发言权限":
+                raise
+            joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
+            if not joined:
+                raise RuntimeError(note or error_message)
+            if repeat_period and repeat_period > 0:
+                return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
+            message = await client.send_message(entity, message_text, schedule=when)
+        return int(message.id)
 
     async def list_scheduled_messages(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> list[dict[str, Any]]:
         async with self.locked_client(session_row["session_file"]) as client:
-            entity = await self._resolve_entity(client, group_row)
-            result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
-            items: list[dict[str, Any]] = []
-            for message in getattr(result, "messages", []):
-                date_value = getattr(message, "date", None)
-                items.append(
-                    {
-                        "message_id": int(getattr(message, "id", 0)),
-                        "text": getattr(message, "message", "") or "",
-                        "schedule_at": date_value.isoformat() if date_value else None,
-                        "repeat_period": read_schedule_repeat_period(message),
-                    }
-                )
-            return items
+            return await self.list_scheduled_messages_with_client(client, group_row)
+
+    async def list_scheduled_messages_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> list[dict[str, Any]]:
+        entity = await self._resolve_entity(client, group_row)
+        result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
+        items: list[dict[str, Any]] = []
+        for message in getattr(result, "messages", []):
+            date_value = getattr(message, "date", None)
+            items.append(
+                {
+                    "message_id": int(getattr(message, "id", 0)),
+                    "text": getattr(message, "message", "") or "",
+                    "schedule_at": date_value.isoformat() if date_value else None,
+                    "repeat_period": read_schedule_repeat_period(message),
+                }
+            )
+        return items
 
     async def delete_scheduled_message(self, session_row: dict[str, Any], group_row: dict[str, Any], message_id: int) -> None:
         async with self.locked_client(session_row["session_file"]) as client:
@@ -745,39 +759,42 @@ class TelethonManager:
 
     async def detect_group_status(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> dict[str, Any]:
         async with self.locked_client(session_row["session_file"]) as client:
-            if not await client.is_user_authorized():
-                raise RuntimeError("账号掉线")
-            try:
-                entity = await self._resolve_entity(client, group_row)
-            except errors.UserNotParticipantError:
-                return {"join_status": "not_joined", "speak_status": "未加入群", "last_error": "未加入群"}
-            if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
-                return {"join_status": "joined", "speak_status": "频道跳过", "last_error": "", "is_channel": 1}
+            return await self.detect_group_status_with_client(client, group_row)
+
+    async def detect_group_status_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> dict[str, Any]:
+        if not await client.is_user_authorized():
+            raise RuntimeError("账号掉线")
+        try:
+            entity = await self._resolve_entity(client, group_row)
+        except errors.UserNotParticipantError:
+            return {"join_status": "not_joined", "speak_status": "未加入群", "last_error": "未加入群"}
+        if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
+            return {"join_status": "joined", "speak_status": "频道跳过", "last_error": "", "is_channel": 1}
+        permissions = await client.get_permissions(entity, "me")
+        if getattr(permissions, "has_left", False):
+            return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
+        can_send_messages = self._permissions_allow_text_send(permissions)
+        if can_send_messages is False:
+            linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
+            if linked_required:
+                return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
+            mute_result = await self._classify_muted_group(client, entity, permissions)
+            if mute_result:
+                return mute_result
+        probe_ok, probe_error = await self._probe_send_message(client, entity)
+        if probe_ok:
+            return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
+        if probe_error in {"无发言权限", "禁言"}:
+            linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
+            if linked_required:
+                return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
             permissions = await client.get_permissions(entity, "me")
-            if getattr(permissions, "has_left", False):
-                return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
-            can_send_messages = self._permissions_allow_text_send(permissions)
-            if can_send_messages is False:
-                linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
-                if linked_required:
-                    return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
-                mute_result = await self._classify_muted_group(client, entity, permissions)
-                if mute_result:
-                    return mute_result
-            probe_ok, probe_error = await self._probe_send_message(client, entity)
-            if probe_ok:
-                return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
-            if probe_error in {"无发言权限", "禁言"}:
-                linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
-                if linked_required:
-                    return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
-                permissions = await client.get_permissions(entity, "me")
-                mute_result = await self._classify_muted_group(client, entity, permissions)
-                if mute_result:
-                    return mute_result
-            if probe_error == "未加入群":
-                return {"join_status": "not_joined", "speak_status": probe_error, "last_error": probe_error}
-            return {"join_status": "joined", "speak_status": probe_error or "无发言权限", "last_error": probe_error or "无发言权限"}
+            mute_result = await self._classify_muted_group(client, entity, permissions)
+            if mute_result:
+                return mute_result
+        if probe_error == "未加入群":
+            return {"join_status": "not_joined", "speak_status": probe_error, "last_error": probe_error}
+        return {"join_status": "joined", "speak_status": probe_error or "无发言权限", "last_error": probe_error or "无发言权限"}
 
     async def leave_group(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> bool:
         async with self.locked_client(session_row["session_file"]) as client:
