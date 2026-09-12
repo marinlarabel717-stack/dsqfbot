@@ -310,14 +310,51 @@ class TelethonManager:
                     parts.append(value)
         return "；".join(parts[:2])
 
-    def classify_account_status(self, me: Any) -> tuple[str, str]:
-        if getattr(me, "deleted", False):
-            return "frozen", "账号已冻结"
-        restricted = bool(getattr(me, "restricted", False))
-        reason_text = self._format_restriction_reason(getattr(me, "restriction_reason", None))
-        if restricted or reason_text:
-            return "frozen", reason_text or "账号已冻结"
+    def classify_account_status(self, me: Any, full_user: Any | None = None) -> tuple[str, str]:
+        candidates = [me]
+        if full_user is not None:
+            nested_user = getattr(full_user, "user", None)
+            if nested_user is not None:
+                candidates.append(nested_user)
+            nested_users = getattr(full_user, "users", None) or []
+            candidates.extend(nested_users)
+
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            if getattr(candidate, "deleted", False):
+                return "frozen", "账号已冻结"
+            restricted = bool(getattr(candidate, "restricted", False))
+            reason_text = self._format_restriction_reason(getattr(candidate, "restriction_reason", None))
+            if restricted or reason_text:
+                return "frozen", reason_text or "账号已冻结"
         return "online", ""
+
+    async def probe_account_status(self, client: TelegramClient, me: Any | None = None) -> tuple[Any, str, str]:
+        current_user = me or await client.get_me()
+        full_user = None
+        try:
+            full_user = await client(functions.users.GetFullUserRequest(id=types.InputUserSelf()))
+        except Exception as exc:
+            error_message = self.describe_error(exc)
+            if error_message in {"账号已冻结", "账号掉线"}:
+                raise RuntimeError(error_message) from exc
+            LOGGER.warning("full user probe failed for account status check: %s", exc)
+
+        status, last_error = self.classify_account_status(current_user, full_user)
+        if status != "online":
+            return current_user, status, last_error
+
+        try:
+            await client.get_dialogs(limit=1)
+        except Exception as exc:
+            error_message = self.describe_error(exc)
+            if error_message == "账号已冻结":
+                return current_user, "frozen", error_message
+            if error_message == "账号掉线":
+                return current_user, "offline", error_message
+            LOGGER.warning("dialog probe failed during account status check: %s", exc)
+        return current_user, status, last_error
 
     def load_session_metadata(self, session_file: str) -> dict[str, Any]:
         metadata_path = self.session_metadata_path(session_file)
@@ -396,8 +433,7 @@ class TelethonManager:
         async with self.locked_client(session_file) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
-            me = await client.get_me()
-            status, last_error = self.classify_account_status(me)
+            me, status, last_error = await self.probe_account_status(client)
             label = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip()
             phone = getattr(me, "phone", None)
             if not label:
@@ -453,8 +489,7 @@ class TelethonManager:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
-            me = await client.get_me()
-            status, last_error = self.classify_account_status(me)
+            me, status, last_error = await self.probe_account_status(client)
             username = getattr(me, "username", None)
             username_set = False
             username_error = None
@@ -478,8 +513,7 @@ class TelethonManager:
         async with self.locked_client(session_row["session_file"]) as client:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
-            me = await client.get_me()
-            status, last_error = self.classify_account_status(me)
+            _, status, last_error = await self.probe_account_status(client)
             if status != "online":
                 raise RuntimeError(last_error or "账号已冻结")
             return await self._list_groups_resilient(client)
