@@ -202,6 +202,222 @@ class DsqfBotApp:
         )
         await self.render(update, text, self.home_keyboard())
 
+    async def refresh_session_state(self, session_id: int) -> tuple[dict[str, Any] | None, str | None]:
+        session_row = self.db.get_session(session_id)
+        if not session_row:
+            return None, None
+        try:
+            info = await self.telethon.verify_session(session_row, auto_set_username=True)
+            self.db.update_session(
+                session_id,
+                status=info.get("status", "online"),
+                is_premium=int(info["is_premium"]),
+                label=info["label"],
+                last_error=info.get("last_error", ""),
+            )
+            note = None
+            if info.get("username_set") and info.get("username"):
+                note = f"已自动生成用户名：@{info['username']}"
+            elif info.get("username_error"):
+                note = f"未能自动生成用户名：{info['username_error']}"
+            return self.db.get_session(session_id), note
+        except Exception as exc:
+            error_message = self.telethon.describe_error(exc)
+            fields: dict[str, Any] = {"last_error": error_message}
+            if error_message == "账号掉线":
+                fields["status"] = "offline"
+            elif error_message == "账号已冻结":
+                fields["status"] = "frozen"
+            self.db.update_session(session_id, **fields)
+            return self.db.get_session(session_id), None
+
+    async def check_all_accounts_inventory(self, update: Update) -> None:
+        sessions = self.db.list_sessions()
+        if not sessions:
+            await self.render(update, "还没有账号，先点“添加账号”。", self.accounts_keyboard())
+            return
+
+        total_groups = sum(len(self.visible_groups(item["id"])) for item in sessions)
+        progress_message = await self.render_message(
+            update,
+            self.all_accounts_inventory_progress_text(
+                checked_accounts=0,
+                total_accounts=len(sessions),
+                checked_groups=0,
+                total_groups=total_groups,
+                sendable=0,
+                limited=0,
+                left=0,
+                failed=0,
+                current_account=None,
+                current_action="正在准备检查...",
+            ),
+        )
+
+        checked_accounts = 0
+        checked_groups = 0
+        sendable = 0
+        limited = 0
+        left = 0
+        failed = 0
+        summaries: list[dict[str, Any]] = []
+
+        for session_row in sessions:
+            checked_accounts += 1
+            current_account = session_row["label"]
+            refreshed_row, refresh_note = await self.refresh_session_state(session_row["id"])
+            if not refreshed_row:
+                failed += 1
+                summaries.append(
+                    {
+                        "label": current_account,
+                        "status": "missing",
+                        "checked_groups": 0,
+                        "sendable": 0,
+                        "limited": 0,
+                        "left": 0,
+                        "failed": 1,
+                        "note": "账号不存在",
+                    }
+                )
+                await self.edit_message(
+                    progress_message,
+                    self.all_accounts_inventory_progress_text(
+                        checked_accounts=checked_accounts,
+                        total_accounts=len(sessions),
+                        checked_groups=checked_groups,
+                        total_groups=total_groups,
+                        sendable=sendable,
+                        limited=limited,
+                        left=left,
+                        failed=failed,
+                        current_account=current_account,
+                        current_action="失败 | 账号不存在",
+                    ),
+                )
+                continue
+
+            account_summary = {
+                "label": refreshed_row["label"],
+                "status": refreshed_row["status"],
+                "checked_groups": 0,
+                "sendable": 0,
+                "limited": 0,
+                "left": 0,
+                "failed": 0,
+                "note": refresh_note or "",
+            }
+
+            if refreshed_row["status"] != "online":
+                if not account_summary["note"]:
+                    account_summary["note"] = refreshed_row.get("last_error") or self.human_session_status(refreshed_row["status"])
+                summaries.append(account_summary)
+                await self.edit_message(
+                    progress_message,
+                    self.all_accounts_inventory_progress_text(
+                        checked_accounts=checked_accounts,
+                        total_accounts=len(sessions),
+                        checked_groups=checked_groups,
+                        total_groups=total_groups,
+                        sendable=sendable,
+                        limited=limited,
+                        left=left,
+                        failed=failed,
+                        current_account=refreshed_row["label"],
+                        current_action=f"跳过 | {account_summary['note']}",
+                    ),
+                )
+                continue
+
+            groups = self.visible_groups(refreshed_row["id"])
+            if not groups:
+                account_summary["note"] = account_summary["note"] or "暂无已同步群"
+                summaries.append(account_summary)
+                await self.edit_message(
+                    progress_message,
+                    self.all_accounts_inventory_progress_text(
+                        checked_accounts=checked_accounts,
+                        total_accounts=len(sessions),
+                        checked_groups=checked_groups,
+                        total_groups=total_groups,
+                        sendable=sendable,
+                        limited=limited,
+                        left=left,
+                        failed=failed,
+                        current_account=refreshed_row["label"],
+                        current_action="完成 | 暂无已同步群",
+                    ),
+                )
+                continue
+
+            for group_row in groups:
+                current_action = "正在检查群状态..."
+                try:
+                    result = await self.telethon.detect_group_status(refreshed_row, group_row)
+                    self.db.update_group(group_row["id"], **result)
+                    if result.get("join_status") == "joined" and result.get("speak_status") == "正常可发":
+                        account_summary["sendable"] += 1
+                        sendable += 1
+                    elif result.get("join_status") != "joined":
+                        account_summary["left"] += 1
+                        left += 1
+                    else:
+                        account_summary["limited"] += 1
+                        limited += 1
+                    current_action = result.get("speak_status") or self.human_join_status(result.get("join_status", ""))
+                except Exception as exc:
+                    message = self.telethon.describe_error(exc)
+                    self.db.update_group(group_row["id"], last_error=message)
+                    if message == "账号掉线":
+                        self.db.update_session(refreshed_row["id"], status="offline", last_error=message)
+                    elif message == "账号已冻结":
+                        self.db.update_session(refreshed_row["id"], status="frozen", last_error=message)
+                    account_summary["failed"] += 1
+                    failed += 1
+                    current_action = f"失败 | {message}"
+
+                account_summary["checked_groups"] += 1
+                checked_groups += 1
+                if (
+                    checked_groups in {1, total_groups}
+                    or checked_groups % 3 == 0
+                    or account_summary["checked_groups"] == len(groups)
+                ):
+                    await self.edit_message(
+                        progress_message,
+                        self.all_accounts_inventory_progress_text(
+                            checked_accounts=checked_accounts,
+                            total_accounts=len(sessions),
+                            checked_groups=checked_groups,
+                            total_groups=total_groups,
+                            sendable=sendable,
+                            limited=limited,
+                            left=left,
+                            failed=failed,
+                            current_account=refreshed_row["label"],
+                            current_action=f"{group_row['title']} | {current_action}",
+                        ),
+                    )
+
+            latest_row = self.db.get_session(refreshed_row["id"])
+            if latest_row:
+                account_summary["status"] = latest_row["status"]
+                if latest_row.get("last_error") and account_summary["failed"] > 0 and not account_summary["note"]:
+                    account_summary["note"] = latest_row["last_error"]
+            summaries.append(account_summary)
+
+        final_text = self.all_accounts_inventory_done_text(
+            summaries=summaries,
+            checked_groups=checked_groups,
+            total_groups=total_groups,
+            sendable=sendable,
+            limited=limited,
+            left=left,
+            failed=failed,
+        )
+        if not await self.edit_message(progress_message, final_text, self.accounts_keyboard()):
+            await self.render(update, final_text, self.accounts_keyboard())
+
     async def finalize_session_login(self, update: Update, user_id: int, payload: dict[str, Any], result: Any) -> None:
         session_id = self.db.create_session(
             label=payload["label"],
@@ -651,6 +867,9 @@ class DsqfBotApp:
             if data == "accounts":
                 await self.render(update, self.accounts_text(), self.accounts_keyboard())
                 return
+            if data == "accounts:check_inventory":
+                await self.check_all_accounts_inventory(update)
+                return
             if data == "account:add":
                 self.db.set_user_state(user_id, "wait_session_label", {})
                 await self.render(update, "先发这个账号的备注名字。", self.state_cancel_keyboard())
@@ -665,34 +884,15 @@ class DsqfBotApp:
                 return
             if data.startswith("account:refresh:"):
                 session_id = int(data.split(":")[-1])
-                session_row = self.db.get_session(session_id)
-                if not session_row:
+                refreshed_row, refresh_note = await self.refresh_session_state(session_id)
+                if not refreshed_row:
                     await self.render(update, "账号不存在。")
                     return
-                try:
-                    info = await self.telethon.verify_session(session_row, auto_set_username=True)
-                    self.db.update_session(
-                        session_id,
-                        status=info.get("status", "online"),
-                        is_premium=int(info["is_premium"]),
-                        label=info["label"],
-                        last_error=info.get("last_error", ""),
-                    )
-                    note = "账号状态已刷新。"
-                    if info.get("username_set") and info.get("username"):
-                        note += f"\n已自动生成用户名：@{info['username']}"
-                    elif info.get("username_error"):
-                        note += f"\n未能自动生成用户名：{info['username_error']}"
-                    await self.render(update, note, self.account_detail_keyboard(session_id))
-                except Exception as exc:
-                    error_message = self.telethon.describe_error(exc)
-                    fields: dict[str, Any] = {"last_error": error_message}
-                    if error_message == "账号掉线":
-                        fields["status"] = "offline"
-                    elif error_message == "账号已冻结":
-                        fields["status"] = "frozen"
-                    self.db.update_session(session_id, **fields)
-                    await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
+                await self.render(
+                    update,
+                    self.account_detail_text(session_id, refresh_note),
+                    self.account_detail_keyboard(session_id),
+                )
                 return
             if data.startswith("account:sync:"):
                 session_id = int(data.split(":")[-1])
@@ -1049,7 +1249,11 @@ class DsqfBotApp:
             return "还没有账号，先点“添加账号”。"
         lines = ["账号列表"]
         for index, item in enumerate(sessions, start=1):
-            lines.append(f"{index}. {item['label']} | {item['phone']} | {'Premium' if item['is_premium'] else '普通'} | {self.human_session_status(item['status'])}")
+            sendable_count, total_groups = self.session_inventory_counts(item["id"])
+            lines.append(
+                f"{index}. {item['label']} | {item['phone']} | "
+                f"{'Premium' if item['is_premium'] else '普通'} | {self.human_session_status(item['status'])} | 可发群 {sendable_count}/{total_groups}"
+            )
         return "\n".join(lines)
 
     def accounts_keyboard(self) -> InlineKeyboardMarkup:
@@ -1058,20 +1262,26 @@ class DsqfBotApp:
             rows.append([InlineKeyboardButton(f"{item['label']} ({'Premium' if item['is_premium'] else '普通'})", callback_data=f"account:view:{item['id']}")])
         rows.append([InlineKeyboardButton("添加账号", callback_data="account:add")])
         rows.append([InlineKeyboardButton("上传Session压缩包", callback_data="account:import_zip")])
+        rows.append([InlineKeyboardButton("一键检查所有账号存货", callback_data="accounts:check_inventory")])
         rows.append([InlineKeyboardButton("返回首页", callback_data="home")])
         return InlineKeyboardMarkup(rows)
 
-    def account_detail_text(self, session_id: int) -> str:
+    def account_detail_text(self, session_id: int, note: str | None = None) -> str:
         row = self.db.get_session(session_id)
         if not row:
             return "账号不存在。"
-        return (
+        sendable_count, total_groups = self.session_inventory_counts(session_id)
+        text = (
             f"账号：{row['label']}\n"
             f"手机号：{row['phone']}\n"
             f"Premium：{'是' if row['is_premium'] else '否'}\n"
             f"状态：{self.human_session_status(row['status'])}\n"
+            f"可发群：{sendable_count}/{total_groups}\n"
             f"错误：{row['last_error'] or '-'}"
         )
+        if note:
+            text += f"\n备注：{note}"
+        return text
 
     def account_detail_keyboard(self, session_id: int) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup(
@@ -1080,11 +1290,22 @@ class DsqfBotApp:
                     InlineKeyboardButton("刷新账号", callback_data=f"account:refresh:{session_id}"),
                     InlineKeyboardButton("同步群组", callback_data=f"account:sync:{session_id}"),
                 ],
+                [InlineKeyboardButton("一键检查所有账号存货", callback_data="accounts:check_inventory")],
                 [InlineKeyboardButton("删除账号", callback_data=f"account:delete:{session_id}")],
                 [InlineKeyboardButton("查看群组", callback_data=f"account:groups:{session_id}")],
                 [InlineKeyboardButton("返回账号列表", callback_data="accounts")],
             ]
         )
+
+    def session_inventory_counts(self, session_id: int) -> tuple[int, int]:
+        groups = self.visible_groups(session_id)
+        total_groups = len(groups)
+        sendable_count = sum(
+            1
+            for item in groups
+            if item.get("join_status") == "joined" and item.get("speak_status") == "正常可发"
+        )
+        return sendable_count, total_groups
 
     def groups_text(self, session_id: int, page: int = 0) -> str:
         groups, total, current_page = self.group_page_items(session_id, page)
@@ -1552,6 +1773,65 @@ class DsqfBotApp:
             lines.append(f"原因：{recent_failures[0]['last_error']}")
         if done >= total and total > 0:
             lines[0] = f"批量加群已完成：{done}/{total}"
+        return "\n".join(lines)
+
+    @staticmethod
+    def all_accounts_inventory_progress_text(
+        checked_accounts: int,
+        total_accounts: int,
+        checked_groups: int,
+        total_groups: int,
+        sendable: int,
+        limited: int,
+        left: int,
+        failed: int,
+        current_account: str | None,
+        current_action: str,
+    ) -> str:
+        lines = [
+            f"正在检查所有账号存货：{checked_accounts}/{total_accounts}",
+            f"已检查群：{checked_groups}/{total_groups}",
+            f"正常可发：{sendable}",
+            f"受限/禁言：{limited}",
+            f"离群/失效：{left}",
+            f"失败：{failed}",
+        ]
+        if current_account:
+            lines.append(f"当前账号：{current_account}")
+        if current_action:
+            lines.append(f"状态：{current_action}")
+        return "\n".join(lines)
+
+    def all_accounts_inventory_done_text(
+        self,
+        summaries: list[dict[str, Any]],
+        checked_groups: int,
+        total_groups: int,
+        sendable: int,
+        limited: int,
+        left: int,
+        failed: int,
+    ) -> str:
+        online_count = sum(1 for item in summaries if item.get("status") == "online")
+        offline_count = sum(1 for item in summaries if item.get("status") == "offline")
+        frozen_count = sum(1 for item in summaries if item.get("status") == "frozen")
+        lines = [
+            "所有账号存货检查完成",
+            f"账号数：{len(summaries)}",
+            f"在线：{online_count} | 掉线：{offline_count} | 冻结：{frozen_count}",
+            f"已检查群：{checked_groups}/{total_groups}",
+            f"正常可发：{sendable} | 受限/禁言：{limited} | 离群/失效：{left} | 失败：{failed}",
+            "",
+            "账号明细：",
+        ]
+        for index, item in enumerate(summaries, start=1):
+            detail = (
+                f"{index}. {item['label']} | {self.human_session_status(item['status'])} | "
+                f"可发 {item['sendable']} | 受限 {item['limited']} | 离群 {item['left']} | 失败 {item['failed']}"
+            )
+            if item.get("note"):
+                detail += f" | {item['note']}"
+            lines.append(detail)
         return "\n".join(lines)
 
     @staticmethod
