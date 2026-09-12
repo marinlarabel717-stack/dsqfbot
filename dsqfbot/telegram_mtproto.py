@@ -539,7 +539,6 @@ class TelethonManager:
                         offset_peer=offset_peer,
                         ignore_pinned=ignore_pinned,
                         ignore_migrated=True,
-                        folder=0,
                     )
                 ]
             except Exception as exc:

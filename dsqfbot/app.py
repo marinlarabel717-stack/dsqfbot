@@ -824,9 +824,9 @@ class DsqfBotApp:
                     )
                     group_count = sum(1 for item in items if not item.get("is_channel"))
                     if is_partial:
-                        sync_note = f"同步完成（部分），本次扫到 {group_count} 个群。由于 Telegram 对话异常，暂未清理旧记录。"
+                        sync_note = f"同步完成（部分），本次扫到 {group_count} 个群（含已分组/归档的群）。由于 Telegram 对话异常，暂未清理旧记录。"
                     else:
-                        sync_note = f"同步完成，共 {group_count} 个群。"
+                        sync_note = f"同步完成，共 {group_count} 个群（含已分组/归档的群）。"
                         if removed_count:
                             sync_note += f" 已清理 {removed_count} 条旧群/频道记录。"
                         sync_note += " 频道已自动隐藏。"
