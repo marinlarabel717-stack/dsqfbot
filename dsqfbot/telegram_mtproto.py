@@ -37,6 +37,7 @@ TELEGRAM_DAILY_REPEAT_PERIOD = 24 * 60 * 60
 CURRENT_MESSAGE_CONSTRUCTOR_ID = 0x3AE56482
 CURRENT_REPEAT_SEND_MESSAGE_CONSTRUCTOR_ID = 0x545CD15A
 LOGGER = logging.getLogger("dsqfbot.telethon")
+SCHEDULE_SEND_RETRY_ATTEMPTS = 3
 
 
 class SendMessageWithRepeatRequest(TLRequest):
@@ -692,34 +693,49 @@ class TelethonManager:
         when: datetime,
         repeat_period: int | None = None,
     ) -> int:
-        before_ids: set[int] = set()
-        loaded_before_ids = False
-        try:
-            async with self.locked_client(session_row["session_file"]) as client:
-                entity = await self._resolve_entity(client, group_row)
-                before_ids = await self._scheduled_message_ids(client, entity)
-                loaded_before_ids = True
-                return await self.schedule_message_with_client(
-                    client,
-                    session_row,
-                    group_row,
-                    message_text,
-                    when,
-                    repeat_period=repeat_period,
-                )
-        except Exception:
-            if loaded_before_ids:
-                matched_id = await self._recover_scheduled_message_after_error(
-                    session_row["session_file"],
-                    group_row,
-                    before_ids,
-                    message_text,
-                    when,
-                    repeat_period,
-                )
-                if matched_id is not None:
-                    return matched_id
-            raise
+        for attempt in range(SCHEDULE_SEND_RETRY_ATTEMPTS):
+            before_ids: set[int] = set()
+            loaded_before_ids = False
+            try:
+                async with self.locked_client(session_row["session_file"]) as client:
+                    entity = await self._resolve_entity(client, group_row)
+                    before_ids = await self._scheduled_message_ids(client, entity)
+                    loaded_before_ids = True
+                    return await self.schedule_message_with_client(
+                        client,
+                        session_row,
+                        group_row,
+                        message_text,
+                        when,
+                        repeat_period=repeat_period,
+                    )
+            except Exception as exc:
+                if loaded_before_ids:
+                    matched_id = await self._recover_scheduled_message_after_error(
+                        session_row["session_file"],
+                        group_row,
+                        before_ids,
+                        message_text,
+                        when,
+                        repeat_period,
+                    )
+                    if matched_id is not None:
+                        return matched_id
+                if self._is_retryable_disconnect_error(exc) and attempt + 1 < SCHEDULE_SEND_RETRY_ATTEMPTS:
+                    retry_delay = 1 + attempt
+                    LOGGER.warning(
+                        "schedule message disconnected for %s at %s, retrying in %ss (%s/%s): %s",
+                        group_row.get("title") or group_row.get("peer_id") or group_row.get("id"),
+                        when.isoformat(),
+                        retry_delay,
+                        attempt + 1,
+                        SCHEDULE_SEND_RETRY_ATTEMPTS,
+                        exc,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    continue
+                raise
+        raise RuntimeError("定时消息创建重试失败")
 
     async def schedule_message_with_client(
         self,
@@ -1241,6 +1257,22 @@ class TelethonManager:
     @property
     def supports_repeat(self) -> bool:
         return self._supports_repeat
+
+    @staticmethod
+    def _is_retryable_disconnect_error(exc: Exception) -> bool:
+        if isinstance(exc, ConnectionError):
+            return True
+        message = (str(exc) or "").strip().lower()
+        return any(
+            fragment in message
+            for fragment in (
+                "while disconnected",
+                "connection was closed",
+                "not connected",
+                "connection aborted",
+                "connection reset",
+            )
+        )
 
     @staticmethod
     def describe_error(exc: Exception) -> str:
