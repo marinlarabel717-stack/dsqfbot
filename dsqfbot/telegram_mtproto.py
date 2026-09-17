@@ -692,8 +692,34 @@ class TelethonManager:
         when: datetime,
         repeat_period: int | None = None,
     ) -> int:
-        async with self.locked_client(session_row["session_file"]) as client:
-            return await self.schedule_message_with_client(client, session_row, group_row, message_text, when, repeat_period=repeat_period)
+        before_ids: set[int] = set()
+        loaded_before_ids = False
+        try:
+            async with self.locked_client(session_row["session_file"]) as client:
+                entity = await self._resolve_entity(client, group_row)
+                before_ids = await self._scheduled_message_ids(client, entity)
+                loaded_before_ids = True
+                return await self.schedule_message_with_client(
+                    client,
+                    session_row,
+                    group_row,
+                    message_text,
+                    when,
+                    repeat_period=repeat_period,
+                )
+        except Exception:
+            if loaded_before_ids:
+                matched_id = await self._recover_scheduled_message_after_error(
+                    session_row["session_file"],
+                    group_row,
+                    before_ids,
+                    message_text,
+                    when,
+                    repeat_period,
+                )
+                if matched_id is not None:
+                    return matched_id
+            raise
 
     async def schedule_message_with_client(
         self,
@@ -1041,6 +1067,32 @@ class TelethonManager:
             messages = [message for message in getattr(result, "messages", []) if int(getattr(message, "id", 0) or 0) > 0]
             return self._fallback_newest_scheduled_message(messages, before_ids, target_text, when)
         return None
+
+    async def _recover_scheduled_message_after_error(
+        self,
+        session_file: str,
+        group_row: dict[str, Any],
+        before_ids: set[int],
+        message_text: str,
+        when: datetime,
+        repeat_period: int | None = None,
+    ) -> int | None:
+        try:
+            async with self.locked_client(session_file) as client:
+                entity = await self._resolve_entity(client, group_row)
+                result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
+                messages = [message for message in getattr(result, "messages", []) if int(getattr(message, "id", 0) or 0) > 0]
+                matched = self._match_scheduled_message(messages, before_ids, (message_text or "").strip(), when, repeat_period)
+                if matched is not None:
+                    LOGGER.warning(
+                        "recovered scheduled message after request error for %s at %s",
+                        group_row.get("title") or group_row.get("peer_id") or group_row.get("id"),
+                        when.isoformat(),
+                    )
+                    return matched
+                return await self._find_new_scheduled_message_id(client, entity, before_ids, message_text, when, repeat_period)
+        except Exception:
+            return None
 
     def _extract_scheduled_message_id_from_result(
         self,
