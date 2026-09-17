@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -13,18 +14,23 @@ class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self.init_schema()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(self.path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=30000;")
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        with self._lock:
+            conn = sqlite3.connect(self.path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+            try:
+                yield conn
+                conn.commit()
+            finally:
+                conn.close()
 
     def init_schema(self) -> None:
         with self.connect() as conn:
