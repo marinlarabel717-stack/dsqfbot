@@ -17,6 +17,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, errors, functions
+from telethon import utils as telethon_utils
+from telethon.client import updates as telethon_updates
 from telethon.tl import alltlobjects, patched as patched_types, types
 from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import (
@@ -261,6 +263,43 @@ def install_repeat_support_patch() -> None:
     alltlobjects.tlobjects[CURRENT_MESSAGE_CONSTRUCTOR_ID] = patched_types.Message
 
 
+def _filter_valid_update_entities(entities: list[Any] | None, bucket_name: str) -> list[Any]:
+    filtered: list[Any] = []
+    dropped: list[str] = []
+    for entity in entities or []:
+        try:
+            telethon_utils.get_peer_id(entity)
+            filtered.append(entity)
+        except TypeError:
+            dropped.append(entity.__class__.__name__)
+        except Exception:
+            filtered.append(entity)
+    if dropped:
+        LOGGER.warning(
+            "Telethon 更新实体已过滤 | 类型=%s | 丢弃数量=%s | 示例=%s",
+            bucket_name,
+            len(dropped),
+            ",".join(dropped[:5]),
+        )
+    return filtered
+
+
+def install_updates_entity_guard_patch() -> None:
+    update_methods = telethon_updates.UpdateMethods
+    if getattr(update_methods, "_dsqfbot_entity_guard_installed", False):
+        return
+
+    original_preprocess_updates = update_methods._preprocess_updates
+
+    async def _guarded_preprocess_updates(self, processed, users, chats):
+        safe_users = _filter_valid_update_entities(users, "users")
+        safe_chats = _filter_valid_update_entities(chats, "chats")
+        return await original_preprocess_updates(self, processed, safe_users, safe_chats)
+
+    update_methods._preprocess_updates = _guarded_preprocess_updates
+    update_methods._dsqfbot_entity_guard_installed = True
+
+
 def read_schedule_repeat_period(message: Any) -> int | None:
     for attr in ("schedule_repeat_period", "schedulePeriod", "schedule_period"):
         raw_value = getattr(message, attr, None)
@@ -290,6 +329,7 @@ class TelethonManager:
         self.config = config
         self.config.session_dir.mkdir(parents=True, exist_ok=True)
         install_repeat_support_patch()
+        install_updates_entity_guard_patch()
         self._supports_repeat = True
         self._session_locks: dict[str, asyncio.Lock] = {}
 
