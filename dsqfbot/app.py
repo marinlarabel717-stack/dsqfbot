@@ -269,13 +269,22 @@ class DsqfBotApp:
         )
         await self.render(update, text, self.home_keyboard())
 
-    async def refresh_session_state(self, session_id: int) -> tuple[dict[str, Any] | None, str | None]:
+    async def refresh_session_state(
+        self,
+        session_id: int,
+        *,
+        prefer_spambot_check: bool = False,
+    ) -> tuple[dict[str, Any] | None, str | None]:
         session_row = self.db.get_session(session_id)
         if not session_row:
             return None, None
         LOGGER.info("refresh session state start | %s", self.describe_session(session_row))
         try:
-            info = await self.telethon.verify_session(session_row, auto_set_username=True)
+            info = await self.telethon.verify_session(
+                session_row,
+                auto_set_username=True,
+                prefer_spambot_check=prefer_spambot_check,
+            )
             self.db.update_session(
                 session_id,
                 status=info.get("status", "online"),
@@ -340,7 +349,10 @@ class DsqfBotApp:
         for session_row in sessions:
             checked_accounts += 1
             current_account = session_row["label"]
-            refreshed_row, _refresh_note = await self.refresh_session_state(session_row["id"])
+            refreshed_row, _refresh_note = await self.refresh_session_state(
+                session_row["id"],
+                prefer_spambot_check=True,
+            )
             if not refreshed_row:
                 other += 1
                 summaries.append({"label": current_account, "status": "missing", "note": "账号不存在"})

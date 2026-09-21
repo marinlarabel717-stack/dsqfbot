@@ -42,6 +42,8 @@ CURRENT_MESSAGE_CONSTRUCTOR_ID = 0x3AE56482
 CURRENT_REPEAT_SEND_MESSAGE_CONSTRUCTOR_ID = 0x545CD15A
 LOGGER = logging.getLogger("dsqfbot.telethon")
 SCHEDULE_SEND_RETRY_ATTEMPTS = 3
+SPAMBOT_USERNAME = "SpamBot"
+SPAMBOT_REPLY_WAIT_SECONDS = 2.5
 
 
 class SendMessageWithRepeatRequest(TLRequest):
@@ -429,6 +431,97 @@ class TelethonManager:
                     parts.append(value)
         return "；".join(parts[:2])
 
+    @staticmethod
+    def _normalize_spambot_text(message: Any) -> str:
+        text = str(getattr(message, "message", "") or getattr(message, "raw_text", "") or "").strip()
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _classify_spambot_reply_text(text: str) -> tuple[str | None, str]:
+        normalized = re.sub(r"\s+", " ", str(text or "").strip())
+        lowered = normalized.lower()
+        if not normalized:
+            return None, ""
+
+        frozen_patterns = (
+            "good news, no limits are currently applied to your account",
+            "you’re free as a bird",
+            "you're free as a bird",
+            "目前没有对你的账号施加任何限制",
+            "当前没有对你的账号施加任何限制",
+            "你的账号当前没有受到任何限制",
+        )
+        restricted_patterns = (
+            "some telegram users have reported your account",
+            "your account is limited",
+            "can no longer send messages to people who do not have your number saved",
+            "can only contact mutual contacts",
+            "账号目前受到限制",
+            "你的账号目前受到限制",
+            "你的账号受到了限制",
+            "无法向未保存你号码的用户发送消息",
+            "只能主动私聊双向联系人",
+            "由于其他用户的举报",
+        )
+
+        if any(pattern in lowered for pattern in frozen_patterns) or any(pattern in normalized for pattern in frozen_patterns):
+            return "online", "SpamBot：未发现限制"
+        if any(pattern in lowered for pattern in restricted_patterns) or any(pattern in normalized for pattern in restricted_patterns):
+            return "frozen", "SpamBot：账号受限"
+        return None, normalized[:120]
+
+    async def _probe_spambot_status(self, client: TelegramClient) -> tuple[str | None, str]:
+        try:
+            entity = await client.get_entity(SPAMBOT_USERNAME)
+        except Exception as exc:
+            LOGGER.warning("resolve @spambot failed: %s", exc)
+            return None, ""
+
+        before_ids: set[int] = set()
+        try:
+            history = await client.get_messages(entity, limit=5)
+            for item in history or []:
+                message_id = int(getattr(item, "id", 0) or 0)
+                if message_id > 0:
+                    before_ids.add(message_id)
+        except Exception as exc:
+            LOGGER.warning("read @spambot history failed: %s", exc)
+
+        try:
+            sent = await client.send_message(entity, "/start")
+        except Exception as exc:
+            message = self.describe_error(exc)
+            if message in {"账号掉线", "账号已冻结"}:
+                raise RuntimeError(message) from exc
+            LOGGER.warning("send /start to @spambot failed: %s", exc)
+            return None, ""
+
+        await asyncio.sleep(SPAMBOT_REPLY_WAIT_SECONDS)
+        try:
+            messages = await client.get_messages(entity, limit=6)
+        except Exception as exc:
+            LOGGER.warning("read @spambot reply failed: %s", exc)
+            return None, ""
+
+        fallback_text = ""
+        sent_id = int(getattr(sent, "id", 0) or 0)
+        for message in messages or []:
+            if getattr(message, "out", False):
+                continue
+            message_id = int(getattr(message, "id", 0) or 0)
+            if message_id > 0 and message_id in before_ids:
+                continue
+            if sent_id > 0 and message_id > 0 and message_id < sent_id:
+                continue
+            reply_text = self._normalize_spambot_text(message)
+            status, note = self._classify_spambot_reply_text(reply_text)
+            if status is not None:
+                return status, note
+            if reply_text and not fallback_text:
+                fallback_text = reply_text[:120]
+
+        return None, fallback_text
+
     def classify_account_status(self, me: Any, full_user: Any | None = None) -> tuple[str, str]:
         candidates = [me]
         if full_user is not None:
@@ -449,7 +542,13 @@ class TelethonManager:
                 return "frozen", reason_text or "账号已冻结"
         return "online", ""
 
-    async def probe_account_status(self, client: TelegramClient, me: Any | None = None) -> tuple[Any, str, str]:
+    async def probe_account_status(
+        self,
+        client: TelegramClient,
+        me: Any | None = None,
+        *,
+        prefer_spambot_check: bool = False,
+    ) -> tuple[Any, str, str]:
         current_user = me or await client.get_me()
         full_user = None
         try:
@@ -463,6 +562,13 @@ class TelethonManager:
         status, last_error = self.classify_account_status(current_user, full_user)
         if status != "online":
             return current_user, status, last_error
+
+        if prefer_spambot_check:
+            spambot_status, spambot_note = await self._probe_spambot_status(client)
+            if spambot_status == "frozen":
+                return current_user, "frozen", spambot_note or "SpamBot：账号受限"
+            if spambot_status == "online":
+                return current_user, "online", spambot_note
 
         try:
             await client.get_dialogs(limit=1)
@@ -634,12 +740,21 @@ class TelethonManager:
 
         return await self._run_with_timeout(_execute(), "完成账号登录")
 
-    async def verify_session(self, session_row: dict[str, Any], auto_set_username: bool = False) -> dict[str, Any]:
+    async def verify_session(
+        self,
+        session_row: dict[str, Any],
+        auto_set_username: bool = False,
+        *,
+        prefer_spambot_check: bool = False,
+    ) -> dict[str, Any]:
         async def _execute() -> dict[str, Any]:
             async with self.locked_client(session_row["session_file"]) as client:
                 if not await client.is_user_authorized():
                     raise RuntimeError("账号掉线")
-                me, status, last_error = await self.probe_account_status(client)
+                me, status, last_error = await self.probe_account_status(
+                    client,
+                    prefer_spambot_check=prefer_spambot_check,
+                )
                 username = getattr(me, "username", None)
                 username_set = False
                 username_error = None
