@@ -391,12 +391,22 @@ class TelethonManager:
             self.session_path(session_file),
             api_id,
             api_hash,
+            timeout=self.config.telethon_timeout_seconds,
+            request_retries=2,
+            connection_retries=2,
+            retry_delay=1,
             device_model=device_model,
             system_version=system_version,
             app_version=app_version,
             lang_code=lang_code,
             system_lang_code=system_lang_code,
         )
+
+    async def _run_with_timeout(self, awaitable: Any, action: str) -> Any:
+        try:
+            return await asyncio.wait_for(awaitable, timeout=self.config.telethon_timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"{action}超时，请重试") from exc
 
     def _get_session_lock(self, session_file: str) -> asyncio.Lock:
         lock = self._session_locks.get(session_file)
@@ -409,11 +419,14 @@ class TelethonManager:
     async def locked_client(self, session_file: str):
         async with self._get_session_lock(session_file):
             client = self.build_client(session_file)
-            await client.connect()
+            await self._run_with_timeout(client.connect(), "连接 Telegram")
             try:
                 yield client
             finally:
-                await client.disconnect()
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
+                except Exception:
+                    pass
 
     def delete_session_files(self, session_file: str) -> None:
         base_path = Path(self.session_path(session_file))
@@ -454,10 +467,13 @@ class TelethonManager:
             }
 
     async def begin_login(self, label: str, phone: str) -> tuple[str, str]:
-        session_file = f"{slugify(label)}-{int(datetime.utcnow().timestamp())}"
-        async with self.locked_client(session_file) as client:
-            sent = await client.send_code_request(phone)
-            return session_file, sent.phone_code_hash
+        async def _execute() -> tuple[str, str]:
+            session_file = f"{slugify(label)}-{int(datetime.utcnow().timestamp())}"
+            async with self.locked_client(session_file) as client:
+                sent = await client.send_code_request(phone)
+                return session_file, sent.phone_code_hash
+
+        return await self._run_with_timeout(_execute(), "发送登录验证码")
 
     async def finish_login(
         self,
@@ -467,58 +483,67 @@ class TelethonManager:
         phone_code_hash: str | None,
         password: str | None = None,
     ) -> LoginResult:
-        async with self.locked_client(session_file) as client:
-            try:
-                if password:
-                    await client.sign_in(password=password)
-                else:
-                    await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
-            except errors.SessionPasswordNeededError:
-                return LoginResult(need_password=True)
-            me = await client.get_me()
-            label = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip()
-            username, username_set, username_error = await self._ensure_random_username(client, me, label or phone)
-            return LoginResult(
-                need_password=False,
-                label=label or phone,
-                is_premium=bool(getattr(me, "premium", False)),
-                username=username,
-                username_set=username_set,
-                username_error=username_error,
-            )
+        async def _execute() -> LoginResult:
+            async with self.locked_client(session_file) as client:
+                try:
+                    if password:
+                        await client.sign_in(password=password)
+                    else:
+                        await client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash)
+                except errors.SessionPasswordNeededError:
+                    return LoginResult(need_password=True)
+                me = await client.get_me()
+                label = " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip()
+                username, username_set, username_error = await self._ensure_random_username(client, me, label or phone)
+                return LoginResult(
+                    need_password=False,
+                    label=label or phone,
+                    is_premium=bool(getattr(me, "premium", False)),
+                    username=username,
+                    username_set=username_set,
+                    username_error=username_error,
+                )
+
+        return await self._run_with_timeout(_execute(), "完成账号登录")
 
     async def verify_session(self, session_row: dict[str, Any], auto_set_username: bool = False) -> dict[str, Any]:
-        async with self.locked_client(session_row["session_file"]) as client:
-            if not await client.is_user_authorized():
-                raise RuntimeError("账号掉线")
-            me, status, last_error = await self.probe_account_status(client)
-            username = getattr(me, "username", None)
-            username_set = False
-            username_error = None
-            if status == "online" and auto_set_username and not username:
-                username, username_set, username_error = await self._ensure_random_username(
-                    client,
-                    me,
-                    session_row.get("label"),
-                )
-            return {
-                "label": " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip() or session_row["label"],
-                "is_premium": bool(getattr(me, "premium", False)),
-                "username": username,
-                "username_set": username_set,
-                "username_error": username_error,
-                "status": status,
-                "last_error": last_error,
-            }
+        async def _execute() -> dict[str, Any]:
+            async with self.locked_client(session_row["session_file"]) as client:
+                if not await client.is_user_authorized():
+                    raise RuntimeError("账号掉线")
+                me, status, last_error = await self.probe_account_status(client)
+                username = getattr(me, "username", None)
+                username_set = False
+                username_error = None
+                if status == "online" and auto_set_username and not username:
+                    username, username_set, username_error = await self._ensure_random_username(
+                        client,
+                        me,
+                        session_row.get("label"),
+                    )
+                return {
+                    "label": " ".join(part for part in [getattr(me, "first_name", ""), getattr(me, "last_name", "")] if part).strip() or session_row["label"],
+                    "is_premium": bool(getattr(me, "premium", False)),
+                    "username": username,
+                    "username_set": username_set,
+                    "username_error": username_error,
+                    "status": status,
+                    "last_error": last_error,
+                }
+
+        return await self._run_with_timeout(_execute(), "校验账号状态")
 
     async def list_groups(self, session_row: dict[str, Any]) -> dict[str, Any]:
-        async with self.locked_client(session_row["session_file"]) as client:
-            if not await client.is_user_authorized():
-                raise RuntimeError("账号掉线")
-            _, status, last_error = await self.probe_account_status(client)
-            if status != "online":
-                raise RuntimeError(last_error or "账号已冻结")
-            return await self._list_groups_resilient(client)
+        async def _execute() -> dict[str, Any]:
+            async with self.locked_client(session_row["session_file"]) as client:
+                if not await client.is_user_authorized():
+                    raise RuntimeError("账号掉线")
+                _, status, last_error = await self.probe_account_status(client)
+                if status != "online":
+                    raise RuntimeError(last_error or "账号已冻结")
+                return await self._list_groups_resilient(client)
+
+        return await self._run_with_timeout(_execute(), "同步群组列表")
 
     async def _list_groups_resilient(self, client: TelegramClient) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
@@ -609,81 +634,84 @@ class TelethonManager:
                 return {"items": items, "is_partial": is_partial}
 
     async def join_link(self, session_row: dict[str, Any], link: str) -> dict[str, Any]:
-        link = normalize_link(link)
-        async with self.locked_client(session_row["session_file"]) as client:
-            if not await client.is_user_authorized():
-                raise RuntimeError("账号掉线")
-            invite_match = INVITE_RE.search(link)
-            public_match = PUBLIC_RE.search(link)
-            if invite_match:
-                invite_hash = invite_match.group(1)
-                try:
-                    await client(CheckChatInviteRequest(invite_hash))
-                    result = await client(ImportChatInviteRequest(invite_hash))
-                    entity = None
-                    chats = getattr(result, "chats", None) or []
-                    if chats:
-                        entity = chats[0]
-                    if entity is None:
-                        entity = await client.get_entity(link)
+        async def _execute() -> dict[str, Any]:
+            normalized_link = normalize_link(link)
+            async with self.locked_client(session_row["session_file"]) as client:
+                if not await client.is_user_authorized():
+                    raise RuntimeError("账号掉线")
+                invite_match = INVITE_RE.search(normalized_link)
+                public_match = PUBLIC_RE.search(normalized_link)
+                if invite_match:
+                    invite_hash = invite_match.group(1)
+                    try:
+                        await client(CheckChatInviteRequest(invite_hash))
+                        result = await client(ImportChatInviteRequest(invite_hash))
+                        entity = None
+                        chats = getattr(result, "chats", None) or []
+                        if chats:
+                            entity = chats[0]
+                        if entity is None:
+                            entity = await client.get_entity(normalized_link)
+                        return {
+                            "peer_id": int(getattr(entity, "id")),
+                            "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
+                            "username": getattr(entity, "username", None),
+                            "link": normalized_link,
+                            "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
+                            "join_status": "joined",
+                        }
+                    except errors.InviteRequestSentError:
+                        preview = await client(CheckChatInviteRequest(invite_hash))
+                        title = getattr(preview, "title", None) or "等待审批"
+                        return {
+                            "peer_id": 0,
+                            "title": title,
+                            "username": None,
+                            "link": normalized_link,
+                            "join_status": "awaiting_approval",
+                        }
+                    except errors.UserAlreadyParticipantError:
+                        entity = await client.get_entity(normalized_link)
+                        return {
+                            "peer_id": int(getattr(entity, "id")),
+                            "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
+                            "username": getattr(entity, "username", None),
+                            "link": normalized_link,
+                            "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
+                            "join_status": "joined",
+                        }
+                if public_match:
+                    username = public_match.group(1)
+                    entity = await client.get_entity(username)
+                    try:
+                        await client(JoinChannelRequest(entity))
+                    except errors.UserAlreadyParticipantError:
+                        pass
                     return {
                         "peer_id": int(getattr(entity, "id")),
                         "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
                         "username": getattr(entity, "username", None),
-                        "link": link,
+                        "link": f"https://t.me/{username}",
                         "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
                         "join_status": "joined",
                     }
-                except errors.InviteRequestSentError:
-                    preview = await client(CheckChatInviteRequest(invite_hash))
-                    title = getattr(preview, "title", None) or "等待审批"
-                    return {
-                        "peer_id": 0,
-                        "title": title,
-                        "username": None,
-                        "link": link,
-                        "join_status": "awaiting_approval",
-                    }
-                except errors.UserAlreadyParticipantError:
-                    entity = await client.get_entity(link)
+                if normalized_link.startswith("@"):
+                    entity = await client.get_entity(normalized_link)
+                    try:
+                        await client(JoinChannelRequest(entity))
+                    except errors.UserAlreadyParticipantError:
+                        pass
                     return {
                         "peer_id": int(getattr(entity, "id")),
                         "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
                         "username": getattr(entity, "username", None),
-                        "link": link,
+                        "link": normalized_link,
                         "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
                         "join_status": "joined",
                     }
-            if public_match:
-                username = public_match.group(1)
-                entity = await client.get_entity(username)
-                try:
-                    await client(JoinChannelRequest(entity))
-                except errors.UserAlreadyParticipantError:
-                    pass
-                return {
-                    "peer_id": int(getattr(entity, "id")),
-                    "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
-                    "username": getattr(entity, "username", None),
-                    "link": f"https://t.me/{username}",
-                    "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
-                    "join_status": "joined",
-                }
-            if link.startswith("@"):
-                entity = await client.get_entity(link)
-                try:
-                    await client(JoinChannelRequest(entity))
-                except errors.UserAlreadyParticipantError:
-                    pass
-                return {
-                    "peer_id": int(getattr(entity, "id")),
-                    "title": getattr(entity, "title", "") or str(getattr(entity, "id")),
-                    "username": getattr(entity, "username", None),
-                    "link": link,
-                    "is_channel": bool(getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False)),
-                    "join_status": "joined",
-                }
-            raise RuntimeError("无法识别群链接")
+                raise RuntimeError("无法识别群链接")
+
+        return await self._run_with_timeout(_execute(), "执行加群任务")
 
     async def schedule_message(
         self,
@@ -746,57 +774,70 @@ class TelethonManager:
         when: datetime,
         repeat_period: int | None = None,
     ) -> int:
-        entity = await self._resolve_entity(client, group_row)
-        try:
-            if repeat_period and repeat_period > 0:
-                if not session_row.get("is_premium"):
-                    raise RuntimeError("原生每天重复只支持 Premium 账号")
-                return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
-            message = await client.send_message(entity, message_text, schedule=when)
-        except Exception as exc:
-            error_message = self.describe_error(exc)
-            if error_message != "无发言权限":
-                raise
-            joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
-            if not joined:
-                raise RuntimeError(note or error_message)
-            if repeat_period and repeat_period > 0:
-                return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
-            message = await client.send_message(entity, message_text, schedule=when)
-        return int(message.id)
+        async def _execute() -> int:
+            entity = await self._resolve_entity(client, group_row)
+            try:
+                if repeat_period and repeat_period > 0:
+                    if not session_row.get("is_premium"):
+                        raise RuntimeError("原生每天重复只支持 Premium 账号")
+                    return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
+                message = await client.send_message(entity, message_text, schedule=when)
+            except Exception as exc:
+                error_message = self.describe_error(exc)
+                if error_message != "无发言权限":
+                    raise
+                joined, note = await self._auto_join_linked_channel_for_speaking(client, entity)
+                if not joined:
+                    raise RuntimeError(note or error_message)
+                if repeat_period and repeat_period > 0:
+                    return await self._schedule_native_repeat_message(client, entity, message_text, when, repeat_period)
+                message = await client.send_message(entity, message_text, schedule=when)
+            return int(message.id)
+
+        return await self._run_with_timeout(_execute(), "创建定时消息")
 
     async def list_scheduled_messages(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> list[dict[str, Any]]:
         async with self.locked_client(session_row["session_file"]) as client:
             return await self.list_scheduled_messages_with_client(client, group_row)
 
     async def list_scheduled_messages_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> list[dict[str, Any]]:
-        entity = await self._resolve_entity(client, group_row)
-        result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
-        items: list[dict[str, Any]] = []
-        for message in getattr(result, "messages", []):
-            date_value = getattr(message, "date", None)
-            items.append(
-                {
-                    "message_id": int(getattr(message, "id", 0)),
-                    "text": getattr(message, "message", "") or "",
-                    "schedule_at": date_value.isoformat() if date_value else None,
-                    "repeat_period": read_schedule_repeat_period(message),
-                }
-            )
-        return items
+        async def _execute() -> list[dict[str, Any]]:
+            entity = await self._resolve_entity(client, group_row)
+            result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
+            items: list[dict[str, Any]] = []
+            for message in getattr(result, "messages", []):
+                date_value = getattr(message, "date", None)
+                items.append(
+                    {
+                        "message_id": int(getattr(message, "id", 0)),
+                        "text": getattr(message, "message", "") or "",
+                        "schedule_at": date_value.isoformat() if date_value else None,
+                        "repeat_period": read_schedule_repeat_period(message),
+                    }
+                )
+            return items
+
+        return await self._run_with_timeout(_execute(), "读取已设定时")
 
     async def delete_scheduled_message(self, session_row: dict[str, Any], group_row: dict[str, Any], message_id: int) -> None:
-        async with self.locked_client(session_row["session_file"]) as client:
-            entity = await self._resolve_entity(client, group_row)
-            await client(DeleteScheduledMessagesRequest(peer=entity, id=[message_id]))
+        async def _execute() -> None:
+            async with self.locked_client(session_row["session_file"]) as client:
+                entity = await self._resolve_entity(client, group_row)
+                await client(DeleteScheduledMessagesRequest(peer=entity, id=[message_id]))
+
+        await self._run_with_timeout(_execute(), "删除定时消息")
 
     async def delete_scheduled_messages(self, session_row: dict[str, Any], group_row: dict[str, Any], message_ids: list[int]) -> int:
         ids = [int(item) for item in message_ids if int(item) > 0]
         if not ids:
             return 0
-        async with self.locked_client(session_row["session_file"]) as client:
-            entity = await self._resolve_entity(client, group_row)
-            await client(DeleteScheduledMessagesRequest(peer=entity, id=ids))
+
+        async def _execute() -> None:
+            async with self.locked_client(session_row["session_file"]) as client:
+                entity = await self._resolve_entity(client, group_row)
+                await client(DeleteScheduledMessagesRequest(peer=entity, id=ids))
+
+        await self._run_with_timeout(_execute(), "批量删除定时消息")
         return len(ids)
 
     async def detect_group_status(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> dict[str, Any]:
@@ -804,46 +845,52 @@ class TelethonManager:
             return await self.detect_group_status_with_client(client, group_row)
 
     async def detect_group_status_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> dict[str, Any]:
-        if not await client.is_user_authorized():
-            raise RuntimeError("账号掉线")
-        try:
-            entity = await self._resolve_entity(client, group_row)
-        except errors.UserNotParticipantError:
-            return {"join_status": "not_joined", "speak_status": "未加入群", "last_error": "未加入群"}
-        if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
-            return {"join_status": "joined", "speak_status": "频道跳过", "last_error": "", "is_channel": 1}
-        permissions = await client.get_permissions(entity, "me")
-        if getattr(permissions, "has_left", False):
-            return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
-        can_send_messages = self._permissions_allow_text_send(permissions)
-        if can_send_messages is False:
-            linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
-            if linked_required:
-                return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
-            mute_result = await self._classify_muted_group(client, entity, permissions)
-            if mute_result:
-                return mute_result
-        probe_ok, probe_error = await self._probe_send_message(client, entity)
-        if probe_ok:
-            return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
-        if probe_error in {"无发言权限", "禁言"}:
-            linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
-            if linked_required:
-                return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
-            permissions = await client.get_permissions(entity, "me")
-            mute_result = await self._classify_muted_group(client, entity, permissions)
-            if mute_result:
-                return mute_result
-        if probe_error == "未加入群":
-            return {"join_status": "not_joined", "speak_status": probe_error, "last_error": probe_error}
-        return {"join_status": "joined", "speak_status": probe_error or "无发言权限", "last_error": probe_error or "无发言权限"}
-
-    async def leave_group(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> bool:
-        async with self.locked_client(session_row["session_file"]) as client:
+        async def _execute() -> dict[str, Any]:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
-            entity = await self._resolve_entity(client, group_row)
-            return await self._leave_entity(client, entity)
+            try:
+                entity = await self._resolve_entity(client, group_row)
+            except errors.UserNotParticipantError:
+                return {"join_status": "not_joined", "speak_status": "未加入群", "last_error": "未加入群"}
+            if getattr(entity, "broadcast", False) and not getattr(entity, "megagroup", False):
+                return {"join_status": "joined", "speak_status": "频道跳过", "last_error": "", "is_channel": 1}
+            permissions = await client.get_permissions(entity, "me")
+            if getattr(permissions, "has_left", False):
+                return {"join_status": "left", "speak_status": "未加入群", "last_error": "账号已离开群"}
+            can_send_messages = self._permissions_allow_text_send(permissions)
+            if can_send_messages is False:
+                linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
+                if linked_required:
+                    return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
+                mute_result = await self._classify_muted_group(client, entity, permissions)
+                if mute_result:
+                    return mute_result
+            probe_ok, probe_error = await self._probe_send_message(client, entity)
+            if probe_ok:
+                return {"join_status": "joined", "speak_status": "正常可发", "last_error": ""}
+            if probe_error in {"无发言权限", "禁言"}:
+                linked_required, linked_note = await self._linked_channel_requirement_note(client, entity)
+                if linked_required:
+                    return {"join_status": "joined", "speak_status": "需订阅频道", "last_error": linked_note or "需订阅频道"}
+                permissions = await client.get_permissions(entity, "me")
+                mute_result = await self._classify_muted_group(client, entity, permissions)
+                if mute_result:
+                    return mute_result
+            if probe_error == "未加入群":
+                return {"join_status": "not_joined", "speak_status": probe_error, "last_error": probe_error}
+            return {"join_status": "joined", "speak_status": probe_error or "无发言权限", "last_error": probe_error or "无发言权限"}
+
+        return await self._run_with_timeout(_execute(), "检测群发言状态")
+
+    async def leave_group(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> bool:
+        async def _execute() -> bool:
+            async with self.locked_client(session_row["session_file"]) as client:
+                if not await client.is_user_authorized():
+                    raise RuntimeError("账号掉线")
+                entity = await self._resolve_entity(client, group_row)
+                return await self._leave_entity(client, entity)
+
+        return bool(await self._run_with_timeout(_execute(), "退出群组"))
 
     async def _resolve_entity(self, client: TelegramClient, group_row: dict[str, Any]):
         if group_row.get("username"):

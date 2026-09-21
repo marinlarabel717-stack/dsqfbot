@@ -73,6 +73,8 @@ CLIENT_SYSTEM_LANG_CODE=zh-hans
 DEFAULT_JOIN_INTERVAL_SECONDS=60
 REPEAT_LOOKAHEAD_MINUTES=5
 DEFAULT_TIMEZONE=Asia/Shanghai
+BOT_CONCURRENT_UPDATES=8
+TELETHON_TIMEOUT_SECONDS=20
 ```
 
 Notes:
@@ -83,6 +85,8 @@ Notes:
 - `DATABASE_PATH`: SQLite database path
 - `SESSION_DIR`: folder for user session files and imported sidecar metadata
 - `CLIENT_*`: explicit client fingerprint sent during login instead of relying on Telethon defaults
+- `BOT_CONCURRENT_UPDATES`: allows long-running task creation to not block `/start` and other bot actions
+- `TELETHON_TIMEOUT_SECONDS`: fails stalled Telegram RPC calls fast instead of hanging indefinitely
 
 ## Run
 

@@ -2044,6 +2044,7 @@ def build_application(config: AppConfig, db: Database, telethon: TelethonManager
     application = (
         ApplicationBuilder()
         .token(config.bot_token)
+        .concurrent_updates(config.bot_concurrent_updates)
         .post_init(runtime.on_startup)
         .post_shutdown(runtime.on_shutdown)
         .build()

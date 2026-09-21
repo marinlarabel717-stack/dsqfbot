@@ -23,6 +23,8 @@ class AppConfig:
     default_join_interval_seconds: int
     repeat_lookahead_minutes: int
     default_timezone: str
+    bot_concurrent_updates: int
+    telethon_timeout_seconds: int
 
     def is_admin(self, user_id: int) -> bool:
         return not self.admin_ids or user_id in self.admin_ids
@@ -59,4 +61,6 @@ def load_config(base_dir: Path) -> AppConfig:
         default_join_interval_seconds=max(int(os.getenv("DEFAULT_JOIN_INTERVAL_SECONDS", "60") or "60"), 5),
         repeat_lookahead_minutes=max(int(os.getenv("REPEAT_LOOKAHEAD_MINUTES", "5") or "5"), 1),
         default_timezone=os.getenv("DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai",
+        bot_concurrent_updates=max(int(os.getenv("BOT_CONCURRENT_UPDATES", "8") or "8"), 1),
+        telethon_timeout_seconds=max(int(os.getenv("TELETHON_TIMEOUT_SECONDS", "20") or "20"), 5),
     )
