@@ -5,6 +5,7 @@ import logging
 import shutil
 import tempfile
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from zipfile import BadZipFile, ZipFile
@@ -19,7 +20,6 @@ from .db import Database
 from .telegram_mtproto import TelethonManager
 from .utils import chunked, format_dt, normalize_login_code, now_iso, parse_links, parse_user_datetime
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger("dsqfbot")
 TELEGRAM_SCHEDULE_LIMIT = 100
 TASKS_PAGE_SIZE = 10
@@ -38,7 +38,7 @@ class DsqfBotApp:
     async def on_startup(self, application: Application) -> None:
         self.application = application
         self._tasks.append(asyncio.create_task(self.join_worker(), name="join-worker"))
-        LOGGER.info("workers started")
+        LOGGER.info("workers started | concurrent_updates=%s", self.config.bot_concurrent_updates)
 
     async def on_shutdown(self, application: Application) -> None:
         for task in self._tasks:
@@ -47,6 +47,30 @@ class DsqfBotApp:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self.application = None
         LOGGER.info("workers stopped")
+
+    @staticmethod
+    def preview_text(text: str | None, limit: int = 80) -> str:
+        content = (text or "").replace("\r", " ").replace("\n", " ").strip()
+        if len(content) <= limit:
+            return content or "-"
+        return f"{content[:limit]}..."
+
+    @staticmethod
+    def describe_session(session_row: dict[str, Any] | None) -> str:
+        if not session_row:
+            return "-"
+        label = str(session_row.get("label") or session_row.get("session_file") or session_row.get("id") or "-")
+        session_id = session_row.get("id")
+        return f"{label}(session_id={session_id})" if session_id is not None else label
+
+    @staticmethod
+    def describe_group(group_row: dict[str, Any] | None) -> str:
+        if not group_row:
+            return "-"
+        title = str(group_row.get("title") or group_row.get("peer_id") or group_row.get("id") or "-")
+        group_id = group_row.get("id")
+        peer_id = group_row.get("peer_id")
+        return f"{title}(group_id={group_id},peer_id={peer_id})"
 
     async def ensure_admin(self, update: Update) -> bool:
         user = update.effective_user
@@ -206,6 +230,7 @@ class DsqfBotApp:
         session_row = self.db.get_session(session_id)
         if not session_row:
             return None, None
+        LOGGER.info("refresh session state start | %s", self.describe_session(session_row))
         try:
             info = await self.telethon.verify_session(session_row, auto_set_username=True)
             self.db.update_session(
@@ -220,6 +245,13 @@ class DsqfBotApp:
                 note = f"已自动生成用户名：@{info['username']}"
             elif info.get("username_error"):
                 note = f"未能自动生成用户名：{info['username_error']}"
+            LOGGER.info(
+                "refresh session state done | %s | status=%s | premium=%s | note=%s",
+                self.describe_session(session_row),
+                info.get("status", "online"),
+                bool(info.get("is_premium")),
+                note or "-",
+            )
             return self.db.get_session(session_id), note
         except Exception as exc:
             error_message = self.telethon.describe_error(exc)
@@ -229,6 +261,11 @@ class DsqfBotApp:
             elif error_message == "账号已冻结":
                 fields["status"] = "frozen"
             self.db.update_session(session_id, **fields)
+            LOGGER.exception(
+                "refresh session state failed | %s | error=%s",
+                self.describe_session(session_row),
+                error_message,
+            )
             return self.db.get_session(session_id), None
 
     async def check_all_accounts_health(self, update: Update) -> None:
@@ -445,6 +482,12 @@ class DsqfBotApp:
         user_id = update.effective_user.id
         state, payload = self.db.get_user_state(user_id)
         text = (update.effective_message.text or "").strip()
+        LOGGER.info(
+            "text update received | user_id=%s | state=%s | text=%s",
+            user_id,
+            state or "-",
+            self.preview_text(text),
+        )
         if not state:
             await self.send_home(update)
             return
@@ -557,6 +600,15 @@ class DsqfBotApp:
                     await self.render(update, "时间必须大于当前时间，格式：2026-09-06 10:30")
                     return
                 session_row = self.db.get_session(payload["session_id"])
+                LOGGER.info(
+                    "schedule time confirmed | user_id=%s | target_scope=%s | session=%s | when=%s | repeat_mode=%s | text=%s",
+                    user_id,
+                    payload.get("target_scope") or "single_group",
+                    self.describe_session(session_row),
+                    when.isoformat(),
+                    payload.get("repeat_mode"),
+                    self.preview_text(payload.get("message_text")),
+                )
                 if payload.get("target_scope") == "sendable_groups":
                     if not session_row:
                         self.db.clear_user_state(user_id)
@@ -577,6 +629,15 @@ class DsqfBotApp:
                 daily_repeat = self.is_daily_repeat_mode(payload["repeat_mode"])
                 try:
                     if interval_minutes is not None:
+                        LOGGER.info(
+                            "single group interval scheduling start | user_id=%s | session=%s | group=%s | repeat_mode=%s | interval_minutes=%s | when=%s",
+                            user_id,
+                            self.describe_session(session_row),
+                            self.describe_group(group_row),
+                            payload["repeat_mode"],
+                            interval_minutes,
+                            when.isoformat(),
+                        )
                         repeat_text = "每天重复" if daily_repeat else "单次"
                         initial_text = (
                             "批量定时创建中：0/?\n"
@@ -636,6 +697,15 @@ class DsqfBotApp:
                         except Exception as exc:
                             message = self.telethon.describe_error(exc)
                             self.db.update_group(group_row["id"], speak_status=message, last_error=message)
+                            LOGGER.exception(
+                                "single group interval scheduling failed | user_id=%s | session=%s | group=%s | created=%s | total=%s | error=%s",
+                                user_id,
+                                self.describe_session(session_row),
+                                self.describe_group(group_row),
+                                progress_state["created"],
+                                progress_state["total"] or "?",
+                                message,
+                            )
                             failed_text = f"批量创建失败：已创建 {progress_state['created']} / {progress_state['total'] or '?'} 条。\n错误：{message}"
                             if not await update_progress_text(failed_text):
                                 await self.render(update, failed_text)
@@ -643,6 +713,15 @@ class DsqfBotApp:
 
                         self.db.clear_user_state(user_id)
                         last_when = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
+                        LOGGER.info(
+                            "single group interval scheduling done | user_id=%s | session=%s | group=%s | created=%s | total=%s | last_when=%s",
+                            user_id,
+                            self.describe_session(session_row),
+                            self.describe_group(group_row),
+                            len(task_ids),
+                            total,
+                            last_when.isoformat(),
+                        )
                         final_text = (
                             f"批量定时创建成功，共 {len(task_ids)} / {total} 条。\n"
                             f"每条：{repeat_text}\n"
@@ -657,6 +736,14 @@ class DsqfBotApp:
                             await self.render(update, final_text, self.tasks_keyboard())
                         return
 
+                    LOGGER.info(
+                        "single group scheduling start | user_id=%s | session=%s | group=%s | repeat_mode=%s | when=%s",
+                        user_id,
+                        self.describe_session(session_row),
+                        self.describe_group(group_row),
+                        payload["repeat_mode"],
+                        when.isoformat(),
+                    )
                     message_id = await self.telethon.schedule_message(
                         session_row,
                         group_row,
@@ -678,6 +765,14 @@ class DsqfBotApp:
                         status="scheduled",
                     )
                     self.db.clear_user_state(user_id)
+                    LOGGER.info(
+                        "single group scheduling done | user_id=%s | session=%s | group=%s | task_id=%s | telegram_message_id=%s",
+                        user_id,
+                        self.describe_session(session_row),
+                        self.describe_group(group_row),
+                        task_id,
+                        message_id,
+                    )
                     success_text = f"定时消息创建成功，任务 ID：{task_id}"
                     runtime_note = self.repeat_runtime_note(payload["repeat_mode"])
                     if runtime_note:
@@ -686,6 +781,14 @@ class DsqfBotApp:
                 except Exception as exc:
                     message = self.telethon.describe_error(exc)
                     self.db.update_group(group_row["id"], speak_status=message, last_error=message)
+                    LOGGER.exception(
+                        "schedule creation failed | user_id=%s | session=%s | group=%s | interval_minutes=%s | error=%s",
+                        user_id,
+                        self.describe_session(session_row),
+                        self.describe_group(group_row),
+                        interval_minutes,
+                        message,
+                    )
                     if interval_minutes is not None:
                         failed_text = f"批量创建失败：已创建 {progress_state['created']} / {progress_state['total'] or '?'} 条。\n错误：{message}"
                         if not await self.edit_message(progress_message, failed_text):
@@ -754,6 +857,12 @@ class DsqfBotApp:
         user_id = query.from_user.id
         data = query.data or ""
         state, payload = self.db.get_user_state(user_id)
+        LOGGER.info(
+            "callback received | user_id=%s | state=%s | data=%s",
+            user_id,
+            state or "-",
+            data or "-",
+        )
         try:
             if data == "home":
                 await self.send_home(update)
@@ -799,6 +908,7 @@ class DsqfBotApp:
                     await self.render(update, "账号不存在。")
                     return
                 try:
+                    LOGGER.info("account sync start | %s", self.describe_session(session_row))
                     sync_result = await self.telethon.list_groups(session_row)
                     items = list(sync_result.get("items") or [])
                     is_partial = bool(sync_result.get("is_partial"))
@@ -830,6 +940,13 @@ class DsqfBotApp:
                         if removed_count:
                             sync_note += f" 已清理 {removed_count} 条旧群/频道记录。"
                         sync_note += " 频道已自动隐藏。"
+                    LOGGER.info(
+                        "account sync done | %s | groups=%s | partial=%s | removed=%s",
+                        self.describe_session(session_row),
+                        group_count,
+                        is_partial,
+                        removed_count,
+                    )
                     await self.render(update, sync_note, self.account_detail_keyboard(session_id))
                 except Exception as exc:
                     error_message = self.telethon.describe_error(exc)
@@ -839,6 +956,11 @@ class DsqfBotApp:
                     elif error_message == "账号已冻结":
                         fields["status"] = "frozen"
                     self.db.update_session(session_id, **fields)
+                    LOGGER.exception(
+                        "account sync failed | %s | error=%s",
+                        self.describe_session(session_row),
+                        error_message,
+                    )
                     await self.render(update, self.account_detail_text(session_id), self.account_detail_keyboard(session_id))
                 return
             if data.startswith("account:delete:"):
@@ -1382,6 +1504,17 @@ class DsqfBotApp:
         else:
             existing = await self.telethon.list_scheduled_messages_with_client(client, group_row)
         remaining = max(TELEGRAM_SCHEDULE_LIMIT - len(existing), 0)
+        LOGGER.info(
+            "interval schedule batch start | session=%s | group=%s | existing=%s | remaining=%s | interval_minutes=%s | repeat_mode=%s | first_when=%s | text=%s",
+            self.describe_session(session_row),
+            self.describe_group(group_row),
+            len(existing),
+            remaining,
+            interval_minutes,
+            repeat_mode,
+            first_when.isoformat(),
+            self.preview_text(message_text),
+        )
         if remaining <= 0:
             raise RuntimeError("这个群的 Telegram 已设定时已经到上限了")
 
@@ -1418,8 +1551,26 @@ class DsqfBotApp:
                 status="scheduled",
             )
             created_task_ids.append(task_id)
+            if len(created_task_ids) in {1, remaining} or len(created_task_ids) % 5 == 0:
+                LOGGER.info(
+                    "interval schedule batch progress | session=%s | group=%s | created=%s/%s | task_id=%s | telegram_message_id=%s | when=%s",
+                    self.describe_session(session_row),
+                    self.describe_group(group_row),
+                    len(created_task_ids),
+                    remaining,
+                    task_id,
+                    message_id,
+                    when.isoformat(),
+                )
             if progress_callback:
                 await progress_callback(len(created_task_ids), remaining, when)
+        LOGGER.info(
+            "interval schedule batch done | session=%s | group=%s | created=%s | repeat_mode=%s",
+            self.describe_session(session_row),
+            self.describe_group(group_row),
+            len(created_task_ids),
+            repeat_mode,
+        )
         return created_task_ids, remaining
 
     async def create_sendable_groups_schedule_batch(
@@ -1444,6 +1595,16 @@ class DsqfBotApp:
         progress_message = None
         progress_chat_id = payload.get("prompt_chat_id")
         progress_message_id = payload.get("prompt_message_id")
+        LOGGER.info(
+            "sendable groups schedule batch start | user_id=%s | session=%s | groups=%s | repeat_mode=%s | interval_minutes=%s | when=%s | text=%s",
+            user_id,
+            self.describe_session(session_row),
+            len(groups),
+            repeat_mode,
+            interval_minutes,
+            when.isoformat(),
+            self.preview_text(payload.get("message_text")),
+        )
 
         async def update_progress_text(current_text: str, keyboard: InlineKeyboardMarkup | None = None) -> bool:
             if await self.edit_message_ref(
@@ -1487,12 +1648,25 @@ class DsqfBotApp:
                 checked += 1
                 current_title = group_row["title"]
                 current_action = "正在检查可发送状态..."
+                LOGGER.info(
+                    "sendable groups schedule batch checking group | session=%s | group=%s | checked=%s/%s",
+                    self.describe_session(session_row),
+                    self.describe_group(group_row),
+                    checked,
+                    len(groups),
+                )
                 try:
                     result = await self.telethon.detect_group_status_with_client(client, group_row)
                     self.db.update_group(group_row["id"], **result)
                     if result.get("join_status") != "joined" or result.get("speak_status") != "正常可发":
                         skipped += 1
                         current_action = f"跳过 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
+                        LOGGER.info(
+                            "sendable groups schedule batch skipped group | session=%s | group=%s | reason=%s",
+                            self.describe_session(session_row),
+                            self.describe_group(group_row),
+                            current_action,
+                        )
                     elif interval_minutes is not None:
                         base_created_tasks = created_tasks
 
@@ -1534,6 +1708,13 @@ class DsqfBotApp:
                         if task_ids:
                             last_scheduled_at = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
                         current_action = f"已创建 {len(task_ids)} 条"
+                        LOGGER.info(
+                            "sendable groups schedule batch scheduled interval group | session=%s | group=%s | created_tasks=%s | total_created_tasks=%s",
+                            self.describe_session(session_row),
+                            self.describe_group(group_row),
+                            len(task_ids),
+                            created_tasks,
+                        )
                     else:
                         message_id = await self.telethon.schedule_message_with_client(
                             client,
@@ -1558,6 +1739,13 @@ class DsqfBotApp:
                         scheduled_groups += 1
                         last_scheduled_at = when
                         current_action = f"已创建任务 {task_id}"
+                        LOGGER.info(
+                            "sendable groups schedule batch scheduled single group | session=%s | group=%s | task_id=%s | telegram_message_id=%s",
+                            self.describe_session(session_row),
+                            self.describe_group(group_row),
+                            task_id,
+                            message_id,
+                        )
                 except Exception as exc:
                     message = self.telethon.describe_error(exc)
                     self.db.update_group(group_row["id"], speak_status=message, last_error=message)
@@ -1567,6 +1755,14 @@ class DsqfBotApp:
                         self.db.update_session(session_row["id"], status="frozen", last_error=message)
                     failed += 1
                     current_action = f"失败 | {message}"
+                    LOGGER.exception(
+                        "sendable groups schedule batch failed group | session=%s | group=%s | checked=%s/%s | error=%s",
+                        self.describe_session(session_row),
+                        self.describe_group(group_row),
+                        checked,
+                        len(groups),
+                        message,
+                    )
 
                 if checked in {1, len(groups)} or checked % 2 == 0:
                     await update_progress_text(
@@ -1597,6 +1793,16 @@ class DsqfBotApp:
             final_lines.append(f"最后一条：{format_dt(last_scheduled_at.isoformat(), self.config.default_timezone)}")
         final_text = "\n".join(final_lines)
         keyboard = self.sendable_groups_schedule_done_keyboard(session_row["id"])
+        LOGGER.info(
+            "sendable groups schedule batch done | user_id=%s | session=%s | checked=%s | scheduled_groups=%s | skipped=%s | failed=%s | created_tasks=%s",
+            user_id,
+            self.describe_session(session_row),
+            checked,
+            scheduled_groups,
+            skipped,
+            failed,
+            created_tasks,
+        )
         if not await update_progress_text(final_text, keyboard):
             await self.render(update, final_text, keyboard)
 
@@ -1983,12 +2189,20 @@ class DsqfBotApp:
             return
         group_row = self.db.get_group(task["group_id"])
         session_row = self.db.get_session(task["session_id"])
+        LOGGER.info(
+            "delete task start | task_id=%s | session=%s | group=%s | telegram_message_id=%s",
+            task_id,
+            self.describe_session(session_row),
+            self.describe_group(group_row),
+            task.get("last_telegram_message_id"),
+        )
         if group_row and session_row and task.get("last_telegram_message_id"):
             try:
                 await self.telethon.delete_scheduled_message(session_row, group_row, int(task["last_telegram_message_id"]))
             except Exception as exc:
                 LOGGER.warning("delete scheduled message failed: %s", exc)
         self.db.update_task(task_id, status="cancelled", next_run_at=None)
+        LOGGER.info("delete task done | task_id=%s", task_id)
 
     async def join_worker(self) -> None:
         while True:
@@ -1997,11 +2211,19 @@ class DsqfBotApp:
                 await asyncio.sleep(5)
                 continue
             batch_id = job.get("batch_id")
+            LOGGER.info(
+                "join worker picked job | job_id=%s | batch_id=%s | session_id=%s | link=%s",
+                job["id"],
+                batch_id,
+                job["session_id"],
+                job["link"],
+            )
             if batch_id:
                 await self.refresh_join_batch_message(int(batch_id))
             session_row = self.db.get_session(job["session_id"])
             if not session_row:
                 self.db.finish_join_job(job["id"], "failed", last_error="账号不存在")
+                LOGGER.warning("join worker missing session | job_id=%s | session_id=%s", job["id"], job["session_id"])
                 if batch_id:
                     await self.refresh_join_batch_message(int(batch_id))
                 continue
@@ -2019,6 +2241,14 @@ class DsqfBotApp:
                         join_status=result.get("join_status", "joined"),
                     )
                 self.db.finish_join_job(job["id"], result.get("join_status", "joined"), group_id=group_id)
+                LOGGER.info(
+                    "join worker completed job | job_id=%s | session=%s | status=%s | group_id=%s | title=%s",
+                    job["id"],
+                    self.describe_session(session_row),
+                    result.get("join_status", "joined"),
+                    group_id,
+                    result.get("title"),
+                )
                 if batch_id:
                     await self.refresh_join_batch_message(int(batch_id))
             except Exception as exc:
@@ -2026,6 +2256,13 @@ class DsqfBotApp:
                 if "风控等待" in message:
                     retry_at = (datetime.utcnow() + timedelta(seconds=self.telethon.extract_wait_seconds(exc))).replace(microsecond=0).isoformat()
                     self.db.retry_join_job(job["id"], retry_at, message)
+                    LOGGER.warning(
+                        "join worker retry job | job_id=%s | session=%s | retry_at=%s | error=%s",
+                        job["id"],
+                        self.describe_session(session_row),
+                        retry_at,
+                        message,
+                    )
                     if batch_id:
                         await self.refresh_join_batch_message(int(batch_id))
                 else:
@@ -2035,9 +2272,49 @@ class DsqfBotApp:
                         status="offline" if message == "账号掉线" else "frozen" if message == "账号已冻结" else session_row["status"],
                         last_error=message,
                     )
+                    LOGGER.exception(
+                        "join worker failed job | job_id=%s | session=%s | error=%s",
+                        job["id"],
+                        self.describe_session(session_row),
+                        message,
+                    )
                     if batch_id:
                         await self.refresh_join_batch_message(int(batch_id))
             await asyncio.sleep(1)
+
+
+def setup_logging(config: AppConfig) -> None:
+    log_level = getattr(logging, config.log_level.upper(), logging.INFO)
+    log_format = "%(asctime)s %(levelname)s %(name)s [%(filename)s:%(lineno)d]: %(message)s"
+    formatter = logging.Formatter(log_format)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(log_level)
+    stream_handler.setFormatter(formatter)
+
+    config.log_file.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = RotatingFileHandler(
+        config.log_file,
+        maxBytes=config.log_max_bytes,
+        backupCount=config.log_backup_count,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(log_level)
+    root_logger.addHandler(stream_handler)
+    root_logger.addHandler(file_handler)
+    logging.captureWarnings(True)
+    LOGGER.info(
+        "logging configured | level=%s | file=%s | max_bytes=%s | backups=%s",
+        config.log_level,
+        config.log_file,
+        config.log_max_bytes,
+        config.log_backup_count,
+    )
 
 def build_application(config: AppConfig, db: Database, telethon: TelethonManager) -> Application:
     runtime = DsqfBotApp(config, db, telethon)
@@ -2059,6 +2336,7 @@ def build_application(config: AppConfig, db: Database, telethon: TelethonManager
 def main() -> None:
     base_dir = Path(__file__).resolve().parents[1]
     config = load_config(base_dir)
+    setup_logging(config)
     if not config.bot_token:
         raise RuntimeError("请先在 .env 里填写 BOT_TOKEN")
     if not config.api_id or not config.api_hash:

@@ -75,6 +75,10 @@ REPEAT_LOOKAHEAD_MINUTES=5
 DEFAULT_TIMEZONE=Asia/Shanghai
 BOT_CONCURRENT_UPDATES=8
 TELETHON_TIMEOUT_SECONDS=20
+LOG_LEVEL=INFO
+LOG_FILE=storage/logs/dsqfbot.log
+LOG_MAX_BYTES=10485760
+LOG_BACKUP_COUNT=5
 ```
 
 Notes:
@@ -87,12 +91,17 @@ Notes:
 - `CLIENT_*`: explicit client fingerprint sent during login instead of relying on Telethon defaults
 - `BOT_CONCURRENT_UPDATES`: allows long-running task creation to not block `/start` and other bot actions
 - `TELETHON_TIMEOUT_SECONDS`: fails stalled Telegram RPC calls fast instead of hanging indefinitely
+- `LOG_LEVEL`: default `INFO`, change to `DEBUG` if you want even denser backend logs
+- `LOG_FILE`: rolling log file path for persistent后台排错
+- `LOG_MAX_BYTES` and `LOG_BACKUP_COUNT`: control log rotation size and retained history files
 
 ## Run
 
 ```bash
 python main.py
 ```
+
+Logs are now written to both stdout and the rotating file configured by `LOG_FILE`. Key paths such as callback handling, batch scheduling progress, join worker execution, Telethon connect/disconnect, timeout, retry, and final error stacks are all logged with timestamps and source line numbers.
 
 ## Button Flow
 
