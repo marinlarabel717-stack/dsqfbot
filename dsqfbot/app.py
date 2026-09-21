@@ -72,6 +72,34 @@ class DsqfBotApp:
         peer_id = group_row.get("peer_id")
         return f"{title}(group_id={group_id},peer_id={peer_id})"
 
+    def log_schedule_flow(
+        self,
+        step: str,
+        user_id: int,
+        payload: dict[str, Any] | None = None,
+        *,
+        session_row: dict[str, Any] | None = None,
+        group_row: dict[str, Any] | None = None,
+        when: datetime | None = None,
+        extra: str | None = None,
+    ) -> None:
+        payload = payload or {}
+        parts = [
+            f"schedule flow | step={step}",
+            f"user_id={user_id}",
+            f"target_scope={payload.get('target_scope') or 'single_group'}",
+            f"session={self.describe_session(session_row)}",
+            f"group={self.describe_group(group_row)}",
+            f"repeat_mode={payload.get('repeat_mode') or payload.get('custom_repeat_prefix') or '-'}",
+        ]
+        if when is not None:
+            parts.append(f"when={when.isoformat()}")
+        if payload.get("message_text"):
+            parts.append(f"text={self.preview_text(payload.get('message_text'))}")
+        if extra:
+            parts.append(extra)
+        LOGGER.info(" | ".join(parts))
+
     async def ensure_admin(self, update: Update) -> bool:
         user = update.effective_user
         if not user or not self.config.is_admin(user.id):
@@ -563,6 +591,14 @@ class DsqfBotApp:
                     self.db.clear_user_state(user_id)
                     await self.render(update, "账号不存在。")
                     return
+                group_row = self.db.get_group(payload["group_id"]) if payload.get("group_id") else None
+                self.log_schedule_flow(
+                    "message_received",
+                    user_id,
+                    payload,
+                    session_row=session_row,
+                    group_row=group_row,
+                )
                 self.db.set_user_state(user_id, "wait_schedule_repeat", payload)
                 await self.render(update, "选择重复方式。", self.repeat_keyboard(bool(session_row["is_premium"])))
                 return
@@ -586,6 +622,16 @@ class DsqfBotApp:
                 repeat_prefix = payload.get("custom_repeat_prefix", "interval")
                 payload.pop("custom_repeat_prefix", None)
                 payload["repeat_mode"] = f"{repeat_prefix}:{interval_minutes}"
+                session_row = self.db.get_session(payload["session_id"])
+                group_row = self.db.get_group(payload["group_id"]) if payload.get("group_id") else None
+                self.log_schedule_flow(
+                    "interval_selected",
+                    user_id,
+                    payload,
+                    session_row=session_row,
+                    group_row=group_row,
+                    extra=f"interval_minutes={interval_minutes}",
+                )
                 self.db.set_user_state(user_id, "wait_schedule_time", payload)
                 prompt = self.batch_schedule_prompt(payload["repeat_mode"], interval_minutes)
                 prompt_message = await self.render_message(update, prompt, self.state_cancel_keyboard())
@@ -600,6 +646,15 @@ class DsqfBotApp:
                     await self.render(update, "时间必须大于当前时间，格式：2026-09-06 10:30")
                     return
                 session_row = self.db.get_session(payload["session_id"])
+                group_row = self.db.get_group(payload["group_id"]) if payload.get("group_id") else None
+                self.log_schedule_flow(
+                    "time_received",
+                    user_id,
+                    payload,
+                    session_row=session_row,
+                    group_row=group_row,
+                    when=when,
+                )
                 LOGGER.info(
                     "schedule time confirmed | user_id=%s | target_scope=%s | session=%s | when=%s | repeat_mode=%s | text=%s",
                     user_id,
@@ -989,7 +1044,9 @@ class DsqfBotApp:
                 if not groups:
                     await self.render(update, "这个账号当前没有可检查的在群群组。", self.groups_keyboard(session_id))
                     return
-                self.db.set_user_state(user_id, "wait_schedule_message", {"session_id": session_id, "target_scope": "sendable_groups"})
+                payload = {"session_id": session_id, "target_scope": "sendable_groups"}
+                self.log_schedule_flow("enter_sendable_groups_schedule", user_id, payload, session_row=session_row)
+                self.db.set_user_state(user_id, "wait_schedule_message", payload)
                 await self.render(update, "把要同步到所有正常可发群的消息内容直接发给我。", self.state_cancel_keyboard())
                 return
             if data.startswith("groups:leave_unsendable:"):
@@ -1143,7 +1200,16 @@ class DsqfBotApp:
                 if not group_row:
                     await self.render(update, "群不存在。")
                     return
-                self.db.set_user_state(user_id, "wait_schedule_message", {"group_id": group_id, "session_id": group_row["session_id"]})
+                session_row = self.db.get_session(group_row["session_id"])
+                payload = {"group_id": group_id, "session_id": group_row["session_id"]}
+                self.log_schedule_flow(
+                    "enter_single_group_schedule",
+                    user_id,
+                    payload,
+                    session_row=session_row,
+                    group_row=group_row,
+                )
+                self.db.set_user_state(user_id, "wait_schedule_message", payload)
                 await self.render(update, "把要发送的消息内容直接发给我。", self.state_cancel_keyboard())
                 return
             if data.startswith("schedule:repeat:"):
@@ -1151,8 +1217,17 @@ class DsqfBotApp:
                     await self.render(update, "当前没有待创建的定时任务。")
                     return
                 repeat_mode = data.removeprefix("schedule:repeat:")
+                session_row = self.db.get_session(payload["session_id"])
+                group_row = self.db.get_group(payload["group_id"]) if payload.get("group_id") else None
                 if repeat_mode in {"interval:custom", "daily_interval:custom"}:
                     payload["custom_repeat_prefix"] = "daily_interval" if repeat_mode.startswith("daily_interval:") else "interval"
+                    self.log_schedule_flow(
+                        "repeat_selected_custom_interval",
+                        user_id,
+                        payload,
+                        session_row=session_row,
+                        group_row=group_row,
+                    )
                     self.db.set_user_state(user_id, "wait_schedule_interval", payload)
                     await self.render(
                         update,
@@ -1161,6 +1236,13 @@ class DsqfBotApp:
                     )
                     return
                 payload["repeat_mode"] = repeat_mode
+                self.log_schedule_flow(
+                    "repeat_selected",
+                    user_id,
+                    payload,
+                    session_row=session_row,
+                    group_row=group_row,
+                )
                 self.db.set_user_state(user_id, "wait_schedule_time", payload)
                 interval_minutes = self.batch_interval_minutes(repeat_mode)
                 if interval_minutes is not None:
@@ -1522,6 +1604,15 @@ class DsqfBotApp:
         daily_repeat = self.is_daily_repeat_mode(repeat_mode)
         for offset in range(remaining):
             when = first_when + timedelta(minutes=interval_minutes * offset)
+            LOGGER.info(
+                "interval schedule batch creating task | session=%s | group=%s | index=%s/%s | when=%s | repeat_mode=%s",
+                self.describe_session(session_row),
+                self.describe_group(group_row),
+                offset + 1,
+                remaining,
+                when.isoformat(),
+                repeat_mode,
+            )
             if client is None:
                 message_id = await self.telethon.schedule_message(
                     session_row,
@@ -2307,6 +2398,9 @@ def setup_logging(config: AppConfig) -> None:
     root_logger.setLevel(log_level)
     root_logger.addHandler(stream_handler)
     root_logger.addHandler(file_handler)
+    logging.getLogger("telethon").setLevel(logging.WARNING)
+    logging.getLogger("telethon.network").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
     logging.captureWarnings(True)
     LOGGER.info(
         "logging configured | level=%s | file=%s | max_bytes=%s | backups=%s",

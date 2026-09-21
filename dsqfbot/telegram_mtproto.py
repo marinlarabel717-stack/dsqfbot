@@ -878,10 +878,16 @@ class TelethonManager:
         return message_id
 
     async def list_scheduled_messages(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> list[dict[str, Any]]:
+        LOGGER.info(
+            "list scheduled messages start | session=%s | group=%s",
+            self._session_label(session_row),
+            self._group_label(group_row),
+        )
         async with self.locked_client(session_row["session_file"]) as client:
             return await self.list_scheduled_messages_with_client(client, group_row)
 
     async def list_scheduled_messages_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> list[dict[str, Any]]:
+        LOGGER.info("list scheduled messages with client start | group=%s", self._group_label(group_row))
         async def _execute() -> list[dict[str, Any]]:
             entity = await self._resolve_entity(client, group_row)
             result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
@@ -928,10 +934,16 @@ class TelethonManager:
         return len(ids)
 
     async def detect_group_status(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> dict[str, Any]:
+        LOGGER.info(
+            "detect group status start | session=%s | group=%s",
+            self._session_label(session_row),
+            self._group_label(group_row),
+        )
         async with self.locked_client(session_row["session_file"]) as client:
             return await self.detect_group_status_with_client(client, group_row)
 
     async def detect_group_status_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> dict[str, Any]:
+        LOGGER.info("detect group status with client start | group=%s", self._group_label(group_row))
         async def _execute() -> dict[str, Any]:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
