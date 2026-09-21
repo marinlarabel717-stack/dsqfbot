@@ -72,6 +72,18 @@ class DsqfBotApp:
         peer_id = group_row.get("peer_id")
         return f"{title}(group_id={group_id},peer_id={peer_id})"
 
+    @staticmethod
+    def schedule_flow_step_text(step: str) -> str:
+        mapping = {
+            "enter_single_group_schedule": "进入单群定时创建",
+            "message_received": "已收到消息内容",
+            "repeat_selected": "已选择重复方式",
+            "repeat_selected_custom_interval": "已选择自定义间隔",
+            "interval_received": "已收到自定义间隔",
+            "time_received": "已收到发送时间",
+        }
+        return mapping.get(step, step)
+
     def log_schedule_flow(
         self,
         step: str,
@@ -84,18 +96,21 @@ class DsqfBotApp:
         extra: str | None = None,
     ) -> None:
         payload = payload or {}
+        target_scope = payload.get("target_scope") or "single_group"
+        target_scope_text = "可发言群批量" if target_scope == "sendable_groups" else "单群"
         parts = [
-            f"schedule flow | step={step}",
-            f"user_id={user_id}",
-            f"target_scope={payload.get('target_scope') or 'single_group'}",
-            f"session={self.describe_session(session_row)}",
-            f"group={self.describe_group(group_row)}",
-            f"repeat_mode={payload.get('repeat_mode') or payload.get('custom_repeat_prefix') or '-'}",
+            "定时流程",
+            f"步骤={self.schedule_flow_step_text(step)}",
+            f"用户={user_id}",
+            f"范围={target_scope_text}",
+            f"账号={self.describe_session(session_row)}",
+            f"群组={self.describe_group(group_row)}",
+            f"重复={payload.get('repeat_mode') or payload.get('custom_repeat_prefix') or '-'}",
         ]
         if when is not None:
-            parts.append(f"when={when.isoformat()}")
+            parts.append(f"时间={when.isoformat()}")
         if payload.get("message_text"):
-            parts.append(f"text={self.preview_text(payload.get('message_text'))}")
+            parts.append(f"内容={self.preview_text(payload.get('message_text'))}")
         if extra:
             parts.append(extra)
         LOGGER.info(" | ".join(parts))
@@ -511,7 +526,7 @@ class DsqfBotApp:
         state, payload = self.db.get_user_state(user_id)
         text = (update.effective_message.text or "").strip()
         LOGGER.info(
-            "text update received | user_id=%s | state=%s | text=%s",
+            "收到文字消息 | 用户=%s | 状态=%s | 内容=%s",
             user_id,
             state or "-",
             self.preview_text(text),
@@ -625,12 +640,12 @@ class DsqfBotApp:
                 session_row = self.db.get_session(payload["session_id"])
                 group_row = self.db.get_group(payload["group_id"]) if payload.get("group_id") else None
                 self.log_schedule_flow(
-                    "interval_selected",
+                    "interval_received",
                     user_id,
                     payload,
                     session_row=session_row,
                     group_row=group_row,
-                    extra=f"interval_minutes={interval_minutes}",
+                    extra=f"间隔分钟={interval_minutes}",
                 )
                 self.db.set_user_state(user_id, "wait_schedule_time", payload)
                 prompt = self.batch_schedule_prompt(payload["repeat_mode"], interval_minutes)
@@ -656,7 +671,7 @@ class DsqfBotApp:
                     when=when,
                 )
                 LOGGER.info(
-                    "schedule time confirmed | user_id=%s | target_scope=%s | session=%s | when=%s | repeat_mode=%s | text=%s",
+                    "定时时间已确认 | 用户=%s | 范围=%s | 账号=%s | 时间=%s | 重复=%s | 内容=%s",
                     user_id,
                     payload.get("target_scope") or "single_group",
                     self.describe_session(session_row),
@@ -685,7 +700,7 @@ class DsqfBotApp:
                 try:
                     if interval_minutes is not None:
                         LOGGER.info(
-                            "single group interval scheduling start | user_id=%s | session=%s | group=%s | repeat_mode=%s | interval_minutes=%s | when=%s",
+                            "单群批量定时开始创建 | 用户=%s | 账号=%s | 群组=%s | 重复=%s | 间隔分钟=%s | 开始时间=%s",
                             user_id,
                             self.describe_session(session_row),
                             self.describe_group(group_row),
@@ -753,7 +768,7 @@ class DsqfBotApp:
                             message = self.telethon.describe_error(exc)
                             self.db.update_group(group_row["id"], speak_status=message, last_error=message)
                             LOGGER.exception(
-                                "single group interval scheduling failed | user_id=%s | session=%s | group=%s | created=%s | total=%s | error=%s",
+                                "单群批量定时创建失败 | 用户=%s | 账号=%s | 群组=%s | 已创建=%s | 总数=%s | 错误=%s",
                                 user_id,
                                 self.describe_session(session_row),
                                 self.describe_group(group_row),
@@ -769,7 +784,7 @@ class DsqfBotApp:
                         self.db.clear_user_state(user_id)
                         last_when = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
                         LOGGER.info(
-                            "single group interval scheduling done | user_id=%s | session=%s | group=%s | created=%s | total=%s | last_when=%s",
+                            "单群批量定时创建完成 | 用户=%s | 账号=%s | 群组=%s | 已创建=%s | 总数=%s | 最后一条时间=%s",
                             user_id,
                             self.describe_session(session_row),
                             self.describe_group(group_row),
@@ -792,7 +807,7 @@ class DsqfBotApp:
                         return
 
                     LOGGER.info(
-                        "single group scheduling start | user_id=%s | session=%s | group=%s | repeat_mode=%s | when=%s",
+                        "单群定时开始创建 | 用户=%s | 账号=%s | 群组=%s | 重复=%s | 时间=%s",
                         user_id,
                         self.describe_session(session_row),
                         self.describe_group(group_row),
@@ -821,7 +836,7 @@ class DsqfBotApp:
                     )
                     self.db.clear_user_state(user_id)
                     LOGGER.info(
-                        "single group scheduling done | user_id=%s | session=%s | group=%s | task_id=%s | telegram_message_id=%s",
+                        "单群定时创建完成 | 用户=%s | 账号=%s | 群组=%s | 任务ID=%s | Telegram消息ID=%s",
                         user_id,
                         self.describe_session(session_row),
                         self.describe_group(group_row),
@@ -837,7 +852,7 @@ class DsqfBotApp:
                     message = self.telethon.describe_error(exc)
                     self.db.update_group(group_row["id"], speak_status=message, last_error=message)
                     LOGGER.exception(
-                        "schedule creation failed | user_id=%s | session=%s | group=%s | interval_minutes=%s | error=%s",
+                        "定时创建失败 | 用户=%s | 账号=%s | 群组=%s | 间隔分钟=%s | 错误=%s",
                         user_id,
                         self.describe_session(session_row),
                         self.describe_group(group_row),
@@ -913,7 +928,7 @@ class DsqfBotApp:
         data = query.data or ""
         state, payload = self.db.get_user_state(user_id)
         LOGGER.info(
-            "callback received | user_id=%s | state=%s | data=%s",
+            "收到按钮回调 | 用户=%s | 状态=%s | 数据=%s",
             user_id,
             state or "-",
             data or "-",
@@ -1587,7 +1602,7 @@ class DsqfBotApp:
             existing = await self.telethon.list_scheduled_messages_with_client(client, group_row)
         remaining = max(TELEGRAM_SCHEDULE_LIMIT - len(existing), 0)
         LOGGER.info(
-            "interval schedule batch start | session=%s | group=%s | existing=%s | remaining=%s | interval_minutes=%s | repeat_mode=%s | first_when=%s | text=%s",
+            "批量定时创建开始 | 账号=%s | 群组=%s | 现有定时=%s | 可创建=%s | 间隔分钟=%s | 重复=%s | 首次时间=%s | 内容=%s",
             self.describe_session(session_row),
             self.describe_group(group_row),
             len(existing),
@@ -1605,7 +1620,7 @@ class DsqfBotApp:
         for offset in range(remaining):
             when = first_when + timedelta(minutes=interval_minutes * offset)
             LOGGER.info(
-                "interval schedule batch creating task | session=%s | group=%s | index=%s/%s | when=%s | repeat_mode=%s",
+                "批量定时正在创建任务 | 账号=%s | 群组=%s | 序号=%s/%s | 时间=%s | 重复=%s",
                 self.describe_session(session_row),
                 self.describe_group(group_row),
                 offset + 1,
@@ -1644,7 +1659,7 @@ class DsqfBotApp:
             created_task_ids.append(task_id)
             if len(created_task_ids) in {1, remaining} or len(created_task_ids) % 5 == 0:
                 LOGGER.info(
-                    "interval schedule batch progress | session=%s | group=%s | created=%s/%s | task_id=%s | telegram_message_id=%s | when=%s",
+                    "批量定时创建进度 | 账号=%s | 群组=%s | 已创建=%s/%s | 任务ID=%s | Telegram消息ID=%s | 时间=%s",
                     self.describe_session(session_row),
                     self.describe_group(group_row),
                     len(created_task_ids),
@@ -1656,7 +1671,7 @@ class DsqfBotApp:
             if progress_callback:
                 await progress_callback(len(created_task_ids), remaining, when)
         LOGGER.info(
-            "interval schedule batch done | session=%s | group=%s | created=%s | repeat_mode=%s",
+            "批量定时创建完成 | 账号=%s | 群组=%s | 已创建=%s | 重复=%s",
             self.describe_session(session_row),
             self.describe_group(group_row),
             len(created_task_ids),
@@ -1687,7 +1702,7 @@ class DsqfBotApp:
         progress_chat_id = payload.get("prompt_chat_id")
         progress_message_id = payload.get("prompt_message_id")
         LOGGER.info(
-            "sendable groups schedule batch start | user_id=%s | session=%s | groups=%s | repeat_mode=%s | interval_minutes=%s | when=%s | text=%s",
+            "可发言群批量定时开始 | 用户=%s | 账号=%s | 群数量=%s | 重复=%s | 间隔分钟=%s | 时间=%s | 内容=%s",
             user_id,
             self.describe_session(session_row),
             len(groups),
@@ -1740,7 +1755,7 @@ class DsqfBotApp:
                 current_title = group_row["title"]
                 current_action = "正在检查可发送状态..."
                 LOGGER.info(
-                    "sendable groups schedule batch checking group | session=%s | group=%s | checked=%s/%s",
+                    "可发言群批量定时检查群组 | 账号=%s | 群组=%s | 进度=%s/%s",
                     self.describe_session(session_row),
                     self.describe_group(group_row),
                     checked,
@@ -1753,7 +1768,7 @@ class DsqfBotApp:
                         skipped += 1
                         current_action = f"跳过 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
                         LOGGER.info(
-                            "sendable groups schedule batch skipped group | session=%s | group=%s | reason=%s",
+                            "可发言群批量定时跳过群组 | 账号=%s | 群组=%s | 原因=%s",
                             self.describe_session(session_row),
                             self.describe_group(group_row),
                             current_action,
@@ -1800,7 +1815,7 @@ class DsqfBotApp:
                             last_scheduled_at = when + timedelta(minutes=interval_minutes * (len(task_ids) - 1))
                         current_action = f"已创建 {len(task_ids)} 条"
                         LOGGER.info(
-                            "sendable groups schedule batch scheduled interval group | session=%s | group=%s | created_tasks=%s | total_created_tasks=%s",
+                            "可发言群批量定时已创建批量任务 | 账号=%s | 群组=%s | 本群创建=%s | 累计创建=%s",
                             self.describe_session(session_row),
                             self.describe_group(group_row),
                             len(task_ids),
@@ -1831,7 +1846,7 @@ class DsqfBotApp:
                         last_scheduled_at = when
                         current_action = f"已创建任务 {task_id}"
                         LOGGER.info(
-                            "sendable groups schedule batch scheduled single group | session=%s | group=%s | task_id=%s | telegram_message_id=%s",
+                            "可发言群批量定时已创建单条任务 | 账号=%s | 群组=%s | 任务ID=%s | Telegram消息ID=%s",
                             self.describe_session(session_row),
                             self.describe_group(group_row),
                             task_id,
@@ -1847,7 +1862,7 @@ class DsqfBotApp:
                     failed += 1
                     current_action = f"失败 | {message}"
                     LOGGER.exception(
-                        "sendable groups schedule batch failed group | session=%s | group=%s | checked=%s/%s | error=%s",
+                        "可发言群批量定时处理群组失败 | 账号=%s | 群组=%s | 进度=%s/%s | 错误=%s",
                         self.describe_session(session_row),
                         self.describe_group(group_row),
                         checked,
@@ -1885,7 +1900,7 @@ class DsqfBotApp:
         final_text = "\n".join(final_lines)
         keyboard = self.sendable_groups_schedule_done_keyboard(session_row["id"])
         LOGGER.info(
-            "sendable groups schedule batch done | user_id=%s | session=%s | checked=%s | scheduled_groups=%s | skipped=%s | failed=%s | created_tasks=%s",
+            "可发言群批量定时完成 | 用户=%s | 账号=%s | 已检查=%s | 已创建群=%s | 跳过=%s | 失败=%s | 累计任务=%s",
             user_id,
             self.describe_session(session_row),
             checked,
@@ -2281,7 +2296,7 @@ class DsqfBotApp:
         group_row = self.db.get_group(task["group_id"])
         session_row = self.db.get_session(task["session_id"])
         LOGGER.info(
-            "delete task start | task_id=%s | session=%s | group=%s | telegram_message_id=%s",
+            "开始删除任务 | 任务ID=%s | 账号=%s | 群组=%s | Telegram消息ID=%s",
             task_id,
             self.describe_session(session_row),
             self.describe_group(group_row),
@@ -2291,9 +2306,9 @@ class DsqfBotApp:
             try:
                 await self.telethon.delete_scheduled_message(session_row, group_row, int(task["last_telegram_message_id"]))
             except Exception as exc:
-                LOGGER.warning("delete scheduled message failed: %s", exc)
+                LOGGER.warning("删除 Telegram 定时消息失败：%s", exc)
         self.db.update_task(task_id, status="cancelled", next_run_at=None)
-        LOGGER.info("delete task done | task_id=%s", task_id)
+        LOGGER.info("删除任务完成 | 任务ID=%s", task_id)
 
     async def join_worker(self) -> None:
         while True:
@@ -2303,7 +2318,7 @@ class DsqfBotApp:
                 continue
             batch_id = job.get("batch_id")
             LOGGER.info(
-                "join worker picked job | job_id=%s | batch_id=%s | session_id=%s | link=%s",
+                "加群工作线程领取任务 | 任务ID=%s | 批次ID=%s | 账号ID=%s | 链接=%s",
                 job["id"],
                 batch_id,
                 job["session_id"],
@@ -2314,7 +2329,7 @@ class DsqfBotApp:
             session_row = self.db.get_session(job["session_id"])
             if not session_row:
                 self.db.finish_join_job(job["id"], "failed", last_error="账号不存在")
-                LOGGER.warning("join worker missing session | job_id=%s | session_id=%s", job["id"], job["session_id"])
+                LOGGER.warning("加群工作线程缺少账号 | 任务ID=%s | 账号ID=%s", job["id"], job["session_id"])
                 if batch_id:
                     await self.refresh_join_batch_message(int(batch_id))
                 continue
@@ -2333,7 +2348,7 @@ class DsqfBotApp:
                     )
                 self.db.finish_join_job(job["id"], result.get("join_status", "joined"), group_id=group_id)
                 LOGGER.info(
-                    "join worker completed job | job_id=%s | session=%s | status=%s | group_id=%s | title=%s",
+                    "加群工作线程任务完成 | 任务ID=%s | 账号=%s | 状态=%s | 群ID=%s | 群名=%s",
                     job["id"],
                     self.describe_session(session_row),
                     result.get("join_status", "joined"),
@@ -2348,7 +2363,7 @@ class DsqfBotApp:
                     retry_at = (datetime.utcnow() + timedelta(seconds=self.telethon.extract_wait_seconds(exc))).replace(microsecond=0).isoformat()
                     self.db.retry_join_job(job["id"], retry_at, message)
                     LOGGER.warning(
-                        "join worker retry job | job_id=%s | session=%s | retry_at=%s | error=%s",
+                        "加群工作线程任务重试 | 任务ID=%s | 账号=%s | 重试时间=%s | 错误=%s",
                         job["id"],
                         self.describe_session(session_row),
                         retry_at,
@@ -2364,7 +2379,7 @@ class DsqfBotApp:
                         last_error=message,
                     )
                     LOGGER.exception(
-                        "join worker failed job | job_id=%s | session=%s | error=%s",
+                        "加群工作线程任务失败 | 任务ID=%s | 账号=%s | 错误=%s",
                         job["id"],
                         self.describe_session(session_row),
                         message,

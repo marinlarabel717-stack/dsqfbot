@@ -429,16 +429,16 @@ class TelethonManager:
 
     async def _run_with_timeout(self, awaitable: Any, action: str) -> Any:
         started = perf_counter()
-        LOGGER.info("telethon action start | action=%s | timeout=%ss", action, self.config.telethon_timeout_seconds)
+        LOGGER.info("Telethon 动作开始 | 动作=%s | 超时=%s秒", action, self.config.telethon_timeout_seconds)
         try:
             result = await asyncio.wait_for(awaitable, timeout=self.config.telethon_timeout_seconds)
-            LOGGER.info("telethon action done | action=%s | elapsed=%.2fs", action, perf_counter() - started)
+            LOGGER.info("Telethon 动作完成 | 动作=%s | 耗时=%.2f秒", action, perf_counter() - started)
             return result
         except asyncio.TimeoutError as exc:
-            LOGGER.warning("telethon action timeout | action=%s | elapsed=%.2fs", action, perf_counter() - started)
+            LOGGER.warning("Telethon 动作超时 | 动作=%s | 耗时=%.2f秒", action, perf_counter() - started)
             raise RuntimeError(f"{action}超时，请重试") from exc
         except Exception:
-            LOGGER.exception("telethon action failed | action=%s | elapsed=%.2fs", action, perf_counter() - started)
+            LOGGER.exception("Telethon 动作失败 | 动作=%s | 耗时=%.2f秒", action, perf_counter() - started)
             raise
 
     def _get_session_lock(self, session_file: str) -> asyncio.Lock:
@@ -450,9 +450,9 @@ class TelethonManager:
 
     @asynccontextmanager
     async def locked_client(self, session_file: str):
-        LOGGER.info("telethon client lock waiting | session_file=%s", session_file)
+        LOGGER.info("Telethon 客户端锁等待中 | session_file=%s", session_file)
         async with self._get_session_lock(session_file):
-            LOGGER.info("telethon client lock acquired | session_file=%s", session_file)
+            LOGGER.info("Telethon 客户端锁已获取 | session_file=%s", session_file)
             client = self.build_client(session_file)
             await self._run_with_timeout(client.connect(), "连接 Telegram")
             try:
@@ -460,9 +460,9 @@ class TelethonManager:
             finally:
                 try:
                     await asyncio.wait_for(client.disconnect(), timeout=5)
-                    LOGGER.info("telethon client disconnected | session_file=%s", session_file)
+                    LOGGER.info("Telethon 客户端已断开 | session_file=%s", session_file)
                 except Exception:
-                    LOGGER.warning("telethon client disconnect failed | session_file=%s", session_file, exc_info=True)
+                    LOGGER.warning("Telethon 客户端断开失败 | session_file=%s", session_file, exc_info=True)
 
     def delete_session_files(self, session_file: str) -> None:
         base_path = Path(self.session_path(session_file))
@@ -755,10 +755,10 @@ class TelethonManager:
                     }
                 raise RuntimeError("无法识别群链接")
 
-        LOGGER.info("join link start | session=%s | link=%s", self._session_label(session_row), link)
+        LOGGER.info("开始执行加群 | 账号=%s | 链接=%s", self._session_label(session_row), link)
         result = await self._run_with_timeout(_execute(), "执行加群任务")
         LOGGER.info(
-            "join link done | session=%s | link=%s | join_status=%s | title=%s",
+            "加群完成 | 账号=%s | 链接=%s | 状态=%s | 标题=%s",
             self._session_label(session_row),
             link,
             result.get("join_status"),
@@ -775,7 +775,7 @@ class TelethonManager:
         repeat_period: int | None = None,
     ) -> int:
         LOGGER.info(
-            "schedule message start | session=%s | group=%s | when=%s | repeat_period=%s | text=%s",
+            "开始创建定时消息 | 账号=%s | 群组=%s | 时间=%s | 重复周期=%s | 内容=%s",
             self._session_label(session_row),
             self._group_label(group_row),
             when.isoformat(),
@@ -810,7 +810,7 @@ class TelethonManager:
                     )
                     if matched_id is not None:
                         LOGGER.info(
-                            "schedule message recovered after error | session=%s | group=%s | message_id=%s",
+                            "异常后恢复到定时消息 | 账号=%s | 群组=%s | 消息ID=%s",
                             self._session_label(session_row),
                             self._group_label(group_row),
                             matched_id,
@@ -819,7 +819,7 @@ class TelethonManager:
                 if self._is_retryable_disconnect_error(exc) and attempt + 1 < SCHEDULE_SEND_RETRY_ATTEMPTS:
                     retry_delay = 1 + attempt
                     LOGGER.warning(
-                        "schedule message disconnected for %s at %s, retrying in %ss (%s/%s): %s",
+                        "创建定时消息时连接断开 | 群组=%s | 时间=%s | %s秒后重试 | 第%s/%s次 | 错误=%s",
                         group_row.get("title") or group_row.get("peer_id") or group_row.get("id"),
                         when.isoformat(),
                         retry_delay,
@@ -857,7 +857,7 @@ class TelethonManager:
                 if not joined:
                     raise RuntimeError(note or error_message)
                 LOGGER.info(
-                    "schedule message auto joined linked channel | session=%s | group=%s | note=%s",
+                    "创建定时消息前已自动加入关联频道 | 账号=%s | 群组=%s | 说明=%s",
                     self._session_label(session_row),
                     self._group_label(group_row),
                     note or error_message,
@@ -869,7 +869,7 @@ class TelethonManager:
 
         message_id = await self._run_with_timeout(_execute(), "创建定时消息")
         LOGGER.info(
-            "schedule message done | session=%s | group=%s | when=%s | message_id=%s",
+            "定时消息创建完成 | 账号=%s | 群组=%s | 时间=%s | 消息ID=%s",
             self._session_label(session_row),
             self._group_label(group_row),
             when.isoformat(),
@@ -879,7 +879,7 @@ class TelethonManager:
 
     async def list_scheduled_messages(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> list[dict[str, Any]]:
         LOGGER.info(
-            "list scheduled messages start | session=%s | group=%s",
+            "开始读取已设定时 | 账号=%s | 群组=%s",
             self._session_label(session_row),
             self._group_label(group_row),
         )
@@ -887,7 +887,7 @@ class TelethonManager:
             return await self.list_scheduled_messages_with_client(client, group_row)
 
     async def list_scheduled_messages_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> list[dict[str, Any]]:
-        LOGGER.info("list scheduled messages with client start | group=%s", self._group_label(group_row))
+        LOGGER.info("开始读取已设定时（复用连接） | 群组=%s", self._group_label(group_row))
         async def _execute() -> list[dict[str, Any]]:
             entity = await self._resolve_entity(client, group_row)
             result = await client(GetScheduledHistoryRequest(peer=entity, hash=0))
@@ -906,7 +906,7 @@ class TelethonManager:
 
         items = await self._run_with_timeout(_execute(), "读取已设定时")
         LOGGER.info(
-            "list scheduled messages done | group=%s | count=%s",
+            "读取已设定时完成 | 群组=%s | 数量=%s",
             self._group_label(group_row),
             len(items),
         )
@@ -935,7 +935,7 @@ class TelethonManager:
 
     async def detect_group_status(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> dict[str, Any]:
         LOGGER.info(
-            "detect group status start | session=%s | group=%s",
+            "开始检测群状态 | 账号=%s | 群组=%s",
             self._session_label(session_row),
             self._group_label(group_row),
         )
@@ -943,7 +943,7 @@ class TelethonManager:
             return await self.detect_group_status_with_client(client, group_row)
 
     async def detect_group_status_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> dict[str, Any]:
-        LOGGER.info("detect group status with client start | group=%s", self._group_label(group_row))
+        LOGGER.info("开始检测群状态（复用连接） | 群组=%s", self._group_label(group_row))
         async def _execute() -> dict[str, Any]:
             if not await client.is_user_authorized():
                 raise RuntimeError("账号掉线")
@@ -981,7 +981,7 @@ class TelethonManager:
 
         result = await self._run_with_timeout(_execute(), "检测群发言状态")
         LOGGER.info(
-            "detect group status done | group=%s | join_status=%s | speak_status=%s",
+            "群状态检测完成 | 群组=%s | 加群状态=%s | 发言状态=%s",
             self._group_label(group_row),
             result.get("join_status"),
             result.get("speak_status"),
