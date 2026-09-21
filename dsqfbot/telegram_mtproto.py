@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 from telethon import TelegramClient, errors, functions
 from telethon import utils as telethon_utils
+from telethon.client import auth as telethon_auth
 from telethon.client import updates as telethon_updates
 from telethon.tl import alltlobjects, patched as patched_types, types
 from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
@@ -300,6 +301,56 @@ def install_updates_entity_guard_patch() -> None:
     update_methods._dsqfbot_entity_guard_installed = True
 
 
+def _extract_updates_state(value: Any) -> Any | None:
+    if value is None:
+        return None
+    if all(hasattr(value, attr) for attr in ("pts", "qts", "date", "seq")):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _extract_updates_state(item)
+            if found is not None:
+                return found
+    return None
+
+
+def install_auth_login_state_guard_patch() -> None:
+    auth_methods = telethon_auth.AuthMethods
+    if getattr(auth_methods, "_dsqfbot_login_state_guard_installed", False):
+        return
+
+    async def _guarded_on_login(self, user):
+        self._mb_entity_cache.set_self_user(user.id, user.bot, user.access_hash)
+        self._authorized = True
+
+        raw_state = await self(functions.updates.GetStateRequest())
+        state = _extract_updates_state(raw_state)
+        if state is None:
+            LOGGER.warning("Telethon 登录态异常，GetStateRequest 返回=%s", type(raw_state).__name__)
+            raw_state = await self(functions.updates.GetStateRequest())
+            state = _extract_updates_state(raw_state)
+        if state is None:
+            raise RuntimeError(f"无法解析 Telegram 登录状态：{type(raw_state).__name__}")
+
+        difference = await self(functions.updates.GetDifferenceRequest(pts=state.pts, date=state.date, qts=state.qts))
+
+        if isinstance(difference, types.updates.Difference):
+            state = _extract_updates_state(difference.state) or difference.state
+        elif isinstance(difference, types.updates.DifferenceSlice):
+            state = _extract_updates_state(difference.intermediate_state) or difference.intermediate_state
+        elif isinstance(difference, types.updates.DifferenceTooLong):
+            state.pts = difference.pts
+
+        self._message_box.load(
+            telethon_auth.SessionState(0, 0, 0, state.pts, state.qts, int(state.date.timestamp()), state.seq, 0),
+            [],
+        )
+        return user
+
+    auth_methods._on_login = _guarded_on_login
+    auth_methods._dsqfbot_login_state_guard_installed = True
+
+
 def read_schedule_repeat_period(message: Any) -> int | None:
     for attr in ("schedule_repeat_period", "schedulePeriod", "schedule_period"):
         raw_value = getattr(message, attr, None)
@@ -330,6 +381,7 @@ class TelethonManager:
         self.config.session_dir.mkdir(parents=True, exist_ok=True)
         install_repeat_support_patch()
         install_updates_entity_guard_patch()
+        install_auth_login_state_guard_patch()
         self._supports_repeat = True
         self._session_locks: dict[str, asyncio.Lock] = {}
 
