@@ -29,6 +29,7 @@ from telethon.tl.functions.messages import (
     DeleteScheduledMessagesRequest,
     GetScheduledHistoryRequest,
     ImportChatInviteRequest,
+    SetTypingRequest,
     SendMessageRequest,
 )
 from telethon.tl.tlobject import TLRequest
@@ -1266,22 +1267,14 @@ class TelethonManager:
         raise errors.UserNotParticipantError(request=None)
 
     async def _probe_send_message(self, client: TelegramClient, entity: Any) -> tuple[bool, str | None]:
-        last_error: str | None = None
-        for probe_text in (random.choice(PROBE_EMOJIS), random.choice(PROBE_SYMBOLS)):
-            try:
-                probe_message = await client.send_message(entity, probe_text)
-            except Exception as exc:
-                message = self.describe_error(exc)
-                if message == "账号掉线":
-                    raise
-                last_error = message
-                continue
-            try:
-                await client.delete_messages(entity, [probe_message.id])
-            except Exception:
-                pass
+        try:
+            await client(SetTypingRequest(peer=entity, action=types.SendMessageTypingAction()))
             return True, None
-        return False, last_error
+        except Exception as exc:
+            message = self.describe_error(exc)
+            if message == "账号掉线":
+                raise
+            return False, message
 
     @staticmethod
     def _permissions_allow_text_send(permissions: Any) -> bool | None:
