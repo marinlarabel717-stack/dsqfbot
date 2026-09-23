@@ -1243,10 +1243,16 @@ class TelethonManager:
     async def leave_group(self, session_row: dict[str, Any], group_row: dict[str, Any]) -> bool:
         async def _execute() -> bool:
             async with self.locked_client(session_row["session_file"]) as client:
-                if not await client.is_user_authorized():
-                    raise RuntimeError("账号掉线")
-                entity = await self._resolve_entity(client, group_row)
-                return await self._leave_entity(client, entity)
+                return await self.leave_group_with_client(client, group_row)
+
+        return bool(await self._run_with_timeout(_execute(), "退出群组"))
+
+    async def leave_group_with_client(self, client: TelegramClient, group_row: dict[str, Any]) -> bool:
+        async def _execute() -> bool:
+            if not await client.is_user_authorized():
+                raise RuntimeError("账号掉线")
+            entity = await self._resolve_entity(client, group_row)
+            return await self._leave_entity(client, entity)
 
         return bool(await self._run_with_timeout(_execute(), "退出群组"))
 
