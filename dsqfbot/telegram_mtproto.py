@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import struct
 import string
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from telethon import TelegramClient, errors, functions
 from telethon import utils as telethon_utils
 from telethon.client import auth as telethon_auth
 from telethon.client import updates as telethon_updates
+from telethon.sessions.sqlite import CURRENT_VERSION as TELETHON_SESSION_SCHEMA_VERSION
 from telethon.tl import alltlobjects, patched as patched_types, types
 from telethon.tl.functions.channels import GetFullChannelRequest, JoinChannelRequest
 from telethon.tl.functions.messages import (
@@ -593,7 +595,50 @@ class TelethonManager:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def normalize_session_schema(self, session_file: str) -> None:
+        session_path = self.session_sqlite_path(session_file)
+        if not session_path.is_file():
+            return
+        try:
+            with sqlite3.connect(session_path) as conn:
+                cursor = conn.cursor()
+                has_sessions = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+                ).fetchone()
+                if not has_sessions:
+                    return
+
+                columns = [str(row[1]) for row in cursor.execute("PRAGMA table_info(sessions)").fetchall()]
+                schema_changed = False
+
+                if "takeout_id" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN takeout_id INTEGER")
+                    schema_changed = True
+                if "tmp_auth_key" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN tmp_auth_key BLOB")
+                    schema_changed = True
+
+                has_version = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='version'"
+                ).fetchone()
+                if schema_changed:
+                    if has_version:
+                        cursor.execute("DELETE FROM version")
+                        cursor.execute("INSERT INTO version VALUES (?)", (TELETHON_SESSION_SCHEMA_VERSION,))
+                    else:
+                        cursor.execute("CREATE TABLE version (version integer primary key)")
+                        cursor.execute("INSERT INTO version VALUES (?)", (TELETHON_SESSION_SCHEMA_VERSION,))
+                    conn.commit()
+                    LOGGER.info(
+                        "Telethon session schema normalized | session_file=%s | columns=%s",
+                        session_file,
+                        ",".join(columns),
+                    )
+        except sqlite3.DatabaseError as exc:
+            LOGGER.warning("failed to normalize session schema for %s: %s", session_file, exc)
+
     def build_client(self, session_file: str) -> TelegramClient:
+        self.normalize_session_schema(session_file)
         metadata = self.load_session_metadata(session_file)
         raw_api_id = metadata.get("app_id")
         try:

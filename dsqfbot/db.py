@@ -164,15 +164,23 @@ class Database:
         with self.connect() as conn:
             conn.execute("DELETE FROM user_state WHERE user_id = ?", (user_id,))
 
-    def create_session(self, label: str, phone: str, session_file: str, is_premium: bool, status: str = "online") -> int:
+    def create_session(
+        self,
+        label: str,
+        phone: str,
+        session_file: str,
+        is_premium: bool,
+        status: str = "online",
+        last_error: str | None = None,
+    ) -> int:
         now = now_iso()
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO sessions (label, phone, session_file, is_premium, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO sessions (label, phone, session_file, is_premium, status, last_error, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (label, phone, session_file, int(is_premium), status, now, now),
+                (label, phone, session_file, int(is_premium), status, last_error, now, now),
             )
             return int(cur.lastrowid)
 
