@@ -259,14 +259,16 @@ class DsqfBotApp:
 
     async def send_home(self, update: Update) -> None:
         sessions = self.db.list_sessions()
-        groups_count = sum(len(self.visible_groups(item["id"])) for item in sessions)
+        sendable_groups_count = sum(len(self.visible_groups(item["id"])) for item in sessions)
         active_tasks = self.db.count_active_tasks(self.active_task_cutoff_iso())
+        remaining_capacity = max(sendable_groups_count * TELEGRAM_SCHEDULE_LIMIT - active_tasks, 0)
         text = (
             "dsqfbot 面板\n\n"
             f"账号数：{len(sessions)}\n"
-            f"群数量：{groups_count}\n"
+            f"群数量：{sendable_groups_count}\n"
             f"待处理加群：{len([job for job in self.db.list_join_jobs(50) if job['status'] in ('pending', 'retry', 'running')])}\n"
-            f"定时任务：{active_tasks}"
+            f"当前有效定时：{active_tasks}\n"
+            f"剩余可建定时位：{remaining_capacity}"
         )
         await self.render(update, text, self.home_keyboard())
 
