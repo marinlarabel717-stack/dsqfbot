@@ -311,6 +311,11 @@ def _extract_updates_state(value: Any) -> Any | None:
         return None
     if all(hasattr(value, attr) for attr in ("pts", "qts", "date", "seq")):
         return value
+    for attr in ("state", "intermediate_state", "dialog"):
+        nested = getattr(value, attr, None)
+        found = _extract_updates_state(nested)
+        if found is not None:
+            return found
     if isinstance(value, (list, tuple)):
         for item in value:
             found = _extract_updates_state(item)
@@ -337,14 +342,22 @@ def install_auth_login_state_guard_patch() -> None:
         if state is None:
             raise RuntimeError(f"无法解析 Telegram 登录状态：{type(raw_state).__name__}")
 
+        base_state = state
         difference = await self(functions.updates.GetDifferenceRequest(pts=state.pts, date=state.date, qts=state.qts))
+        difference_state = _extract_updates_state(difference)
 
-        if isinstance(difference, types.updates.Difference):
-            state = _extract_updates_state(difference.state) or difference.state
-        elif isinstance(difference, types.updates.DifferenceSlice):
-            state = _extract_updates_state(difference.intermediate_state) or difference.intermediate_state
+        if difference_state is not None:
+            state = difference_state
         elif isinstance(difference, types.updates.DifferenceTooLong):
-            state.pts = difference.pts
+            base_state.pts = difference.pts
+            state = base_state
+        else:
+            LOGGER.warning("Telethon difference state å¼‚å¸¸ï¼ŒGetDifferenceRequest è¿”å›ž=%s", type(difference).__name__)
+            state = base_state
+
+        state = _extract_updates_state(state)
+        if state is None:
+            raise RuntimeError(f"æ— æ³•è§£æž Telegram difference çŠ¶æ€ï¼š{type(difference).__name__}")
 
         self._message_box.load(
             telethon_auth.SessionState(0, 0, 0, state.pts, state.qts, int(state.date.timestamp()), state.seq, 0),
