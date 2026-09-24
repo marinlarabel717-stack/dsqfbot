@@ -209,6 +209,7 @@ def _patched_message_from_reader(cls, reader):
     _suggested_post = reader.tgread_object() if flags2 & 128 else None
     _schedule_repeat_period = reader.read_int() if flags2 & 1024 else None
     _summary_from_language = reader.tgread_string() if flags2 & 2048 else None
+    _rich_message = reader.tgread_object() if flags2 & 8192 else None
 
     message = cls(
         id=_id,
@@ -232,10 +233,12 @@ def _patched_message_from_reader(cls, reader):
         paid_suggested_post_ton=_paid_suggested_post_ton,
         from_id=_from_id,
         from_boosts_applied=_from_boosts_applied,
+        from_rank=_from_rank,
         saved_peer_id=_saved_peer_id,
         fwd_from=_fwd_from,
         via_bot_id=_via_bot_id,
         via_business_bot_id=_via_business_bot_id,
+        guestchat_via_from=_guestchat_via_from,
         reply_to=_reply_to,
         media=_media,
         reply_markup=_reply_markup,
@@ -255,11 +258,10 @@ def _patched_message_from_reader(cls, reader):
         report_delivery_until_date=_report_delivery_until_date,
         paid_message_stars=_paid_message_stars,
         suggested_post=_suggested_post,
+        schedule_repeat_period=_schedule_repeat_period,
+        summary_from_language=_summary_from_language,
+        rich_message=_rich_message,
     )
-    message.from_rank = _from_rank
-    message.guestchat_via_from = _guestchat_via_from
-    message.schedule_repeat_period = _schedule_repeat_period
-    message.summary_from_language = _summary_from_language
     return message
 
 
