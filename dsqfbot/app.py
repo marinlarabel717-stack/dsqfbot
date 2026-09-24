@@ -1082,7 +1082,7 @@ class DsqfBotApp:
                 if not session_row:
                     await self.render(update, "账号不存在。")
                     return
-                groups = self.visible_groups(session_id)
+                groups = self.managed_groups(session_id)
                 if not groups:
                     await self.render(update, "这个账号当前没有可检查的在群群组。", self.groups_keyboard(session_id))
                     return
@@ -1109,7 +1109,10 @@ class DsqfBotApp:
                         try:
                             result = await self.telethon.detect_group_status_with_client(client, group_row)
                             self.db.update_group(group_row["id"], **result)
-                            if result.get("join_status") == "joined" and result.get("speak_status") != "正常可发":
+                            if result.get("join_status") == "joined" and result.get("speak_status") == "正常可发":
+                                skipped += 1
+                                current_action = "保留 | 正常可发"
+                            elif result.get("join_status") == "joined":
                                 left_group = await self.telethon.leave_group_with_client(client, group_row)
                                 if left_group:
                                     self.db.update_group(group_row["id"], join_status="left", speak_status="已退出", last_error="")
@@ -1117,10 +1120,10 @@ class DsqfBotApp:
                                     current_action = f"已退出 | {result.get('speak_status') or '无法发送'}"
                                 else:
                                     skipped += 1
-                                    current_action = f"跳过频道 | {result.get('speak_status') or '无法发送'}"
+                                    current_action = f"隐藏失败 | {result.get('speak_status') or '无法发送'}"
                             else:
                                 skipped += 1
-                                current_action = f"跳过 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
+                                current_action = f"隐藏 | {result.get('speak_status') or self.human_join_status(result.get('join_status', ''))}"
                         except Exception as exc:
                             message = self.telethon.describe_error(exc)
                             self.db.update_group(group_row["id"], last_error=message)
@@ -1144,9 +1147,9 @@ class DsqfBotApp:
                                 ),
                             )
                 summary = (
-                    f"检查完成：共 {checked} 个群\n"
+                    f"处理完成：共 {checked} 个群\n"
                     f"已退出：{left_count}\n"
-                    f"跳过：{skipped}\n"
+                    f"保留/隐藏：{skipped}\n"
                     f"失败：{failed}"
                 )
                 final_text = f"{summary}\n\n{self.groups_text(session_id)}"
@@ -1428,13 +1431,8 @@ class DsqfBotApp:
         )
 
     def session_inventory_counts(self, session_id: int) -> tuple[int, int]:
-        groups = self.visible_groups(session_id)
-        total_groups = len(groups)
-        sendable_count = sum(
-            1
-            for item in groups
-            if item.get("join_status") == "joined" and item.get("speak_status") == "正常可发"
-        )
+        sendable_count = len(self.visible_groups(session_id))
+        total_groups = len(self.managed_groups(session_id))
         return sendable_count, total_groups
 
     def groups_text(self, session_id: int, page: int = 0) -> str:
@@ -1460,11 +1458,11 @@ class DsqfBotApp:
         if nav_row:
             rows.append(nav_row)
         rows.append([InlineKeyboardButton("一键给正常可发群建定时", callback_data=f"groups:schedule_sendable:{session_id}")])
-        rows.append([InlineKeyboardButton("一键退出无法发送的群", callback_data=f"groups:leave_unsendable:{session_id}")])
+        rows.append([InlineKeyboardButton("一键退出并隐藏不可发群", callback_data=f"groups:leave_unsendable:{session_id}")])
         rows.append([InlineKeyboardButton("返回账号详情", callback_data=f"account:view:{session_id}")])
         return InlineKeyboardMarkup(rows)
 
-    def visible_groups(self, session_id: int) -> list[dict[str, Any]]:
+    def managed_groups(self, session_id: int) -> list[dict[str, Any]]:
         groups = [
             item
             for item in self.db.list_groups(session_id)
@@ -1473,6 +1471,14 @@ class DsqfBotApp:
             and item.get("speak_status") != "频道跳过"
         ]
         groups.sort(key=lambda item: int(item.get("id") or 0))
+        return groups
+
+    def visible_groups(self, session_id: int) -> list[dict[str, Any]]:
+        groups = [
+            item
+            for item in self.managed_groups(session_id)
+            if item.get("join_status") == "joined" and item.get("speak_status") == "正常可发"
+        ]
         return groups
 
     def group_page_items(self, session_id: int, page: int = 0) -> tuple[list[dict[str, Any]], int, int]:
