@@ -260,12 +260,13 @@ class DsqfBotApp:
     async def send_home(self, update: Update) -> None:
         sessions = self.db.list_sessions()
         groups_count = sum(len(self.visible_groups(item["id"])) for item in sessions)
+        active_tasks = self.db.count_active_tasks(self.active_task_cutoff_iso())
         text = (
             "dsqfbot 面板\n\n"
             f"账号数：{len(sessions)}\n"
             f"群数量：{groups_count}\n"
             f"待处理加群：{len([job for job in self.db.list_join_jobs(50) if job['status'] in ('pending', 'retry', 'running')])}\n"
-            f"定时任务：{self.db.count_tasks()}"
+            f"定时任务：{active_tasks}"
         )
         await self.render(update, text, self.home_keyboard())
 
@@ -2149,6 +2150,9 @@ class DsqfBotApp:
         cutoff = datetime.now(tz=ZoneInfo(self.config.default_timezone)) - timedelta(minutes=1)
         return self.db.delete_completed_once_tasks(cutoff.isoformat())
 
+    def active_task_cutoff_iso(self) -> str:
+        return datetime.now(tz=ZoneInfo(self.config.default_timezone)).isoformat()
+
     @staticmethod
     def parse_callback_page(data: str, prefix: str) -> int:
         if not data.startswith(prefix):
@@ -2163,12 +2167,13 @@ class DsqfBotApp:
 
     def task_page_items(self, page: int = 0) -> tuple[list[dict[str, Any]], int, int]:
         self.prune_completed_once_tasks()
-        total = self.db.count_tasks()
+        cutoff_iso = self.active_task_cutoff_iso()
+        total = self.db.count_active_tasks(cutoff_iso)
         if total <= 0:
             return [], 0, 0
         max_page = max(0, (total - 1) // TASKS_PAGE_SIZE)
         current_page = max(0, min(page, max_page))
-        tasks = self.db.list_tasks(limit=TASKS_PAGE_SIZE, offset=current_page * TASKS_PAGE_SIZE)
+        tasks = self.db.list_active_tasks(cutoff_iso, limit=TASKS_PAGE_SIZE, offset=current_page * TASKS_PAGE_SIZE)
         return tasks, total, current_page
 
     def tasks_text(self, page: int = 0) -> str:
@@ -2212,6 +2217,10 @@ class DsqfBotApp:
         item = self.db.get_task(task_id)
         if not item:
             return "任务不存在。"
+        if item.get("status") == "scheduled" and item.get("repeat_mode") == "once":
+            schedule_at = str(item.get("schedule_at") or "")
+            if schedule_at and schedule_at <= self.active_task_cutoff_iso():
+                return "任务不存在。"
         lines = [
             f"任务 ID：{item['id']}",
             f"账号：{item['session_label']}",

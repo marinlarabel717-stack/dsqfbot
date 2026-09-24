@@ -493,6 +493,22 @@ class Database:
             row = conn.execute("SELECT COUNT(*) AS total FROM tasks").fetchone()
         return int(row["total"] if row else 0)
 
+    def count_active_tasks(self, cutoff_iso: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM tasks
+                WHERE status='scheduled'
+                  AND (
+                    repeat_mode != 'once'
+                    OR schedule_at > ?
+                  )
+                """,
+                (cutoff_iso,),
+            ).fetchone()
+        return int(row["total"] if row else 0)
+
     def list_tasks(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -505,6 +521,26 @@ class Database:
                 LIMIT ? OFFSET ?
                 """,
                 (limit, offset),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_active_tasks(self, cutoff_iso: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT tasks.*, groups.title AS group_title, sessions.label AS session_label
+                FROM tasks
+                JOIN groups ON groups.id = tasks.group_id
+                JOIN sessions ON sessions.id = tasks.session_id
+                WHERE tasks.status='scheduled'
+                  AND (
+                    tasks.repeat_mode != 'once'
+                    OR tasks.schedule_at > ?
+                  )
+                ORDER BY tasks.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (cutoff_iso, limit, offset),
             ).fetchall()
         return [dict(row) for row in rows]
 
