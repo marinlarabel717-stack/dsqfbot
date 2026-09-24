@@ -1441,9 +1441,13 @@ class DsqfBotApp:
     def groups_text(self, session_id: int, page: int = 0) -> str:
         groups, total, current_page = self.group_page_items(session_id, page)
         if not groups:
-            return "这个账号当前没有显示中的在群群组。"
+            return "这个账号当前没有在群群组。"
         total_pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
-        lines = [f"群组列表（第 {current_page + 1}/{total_pages} 页，共 {total} 个）"]
+        sendable_count = len(self.visible_groups(session_id))
+        lines = [
+            f"群组列表（第 {current_page + 1}/{total_pages} 页，共 {total} 个）",
+            f"正常可发：{sendable_count}/{total}",
+        ]
         start_index = current_page * GROUPS_PAGE_SIZE
         for index, item in enumerate(groups, start=start_index + 1):
             group_link = item["link"] or (f"https://t.me/{item['username']}" if item.get("username") else "-")
@@ -1485,7 +1489,7 @@ class DsqfBotApp:
         return groups
 
     def group_page_items(self, session_id: int, page: int = 0) -> tuple[list[dict[str, Any]], int, int]:
-        groups = self.visible_groups(session_id)
+        groups = self.managed_groups(session_id)
         total = len(groups)
         if total <= 0:
             return [], 0, 0
