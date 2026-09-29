@@ -1439,7 +1439,7 @@ class DsqfBotApp:
         return sendable_count, total_groups
 
     def groups_text(self, session_id: int, page: int = 0) -> str:
-        groups, total, current_page = self.group_page_items(session_id, page)
+        groups, total, current_page, fallback_mode = self.group_page_items(session_id, page)
         if not groups:
             return "这个账号当前没有在群群组。"
         total_pages = max(1, (total + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
@@ -1448,6 +1448,8 @@ class DsqfBotApp:
             f"群组列表（第 {current_page + 1}/{total_pages} 页，共 {total} 个）",
             f"正常可发：{sendable_count}/{total}",
         ]
+        if fallback_mode:
+            lines.append("提示：当前没有判定为“已在群”的群，下面先显示最近同步到的非频道记录。")
         start_index = current_page * GROUPS_PAGE_SIZE
         for index, item in enumerate(groups, start=start_index + 1):
             group_link = item["link"] or (f"https://t.me/{item['username']}" if item.get("username") else "-")
@@ -1455,7 +1457,7 @@ class DsqfBotApp:
         return "\n".join(lines)
 
     def groups_keyboard(self, session_id: int, page: int = 0) -> InlineKeyboardMarkup:
-        groups, total, current_page = self.group_page_items(session_id, page)
+        groups, total, current_page, _ = self.group_page_items(session_id, page)
         rows = [[InlineKeyboardButton(item["title"][:40], callback_data=f"group:view:{item['id']}:{current_page}")] for item in groups]
         nav_row: list[InlineKeyboardButton] = []
         if current_page > 0:
@@ -1488,16 +1490,29 @@ class DsqfBotApp:
         ]
         return groups
 
-    def group_page_items(self, session_id: int, page: int = 0) -> tuple[list[dict[str, Any]], int, int]:
+    def synced_non_channel_groups(self, session_id: int) -> list[dict[str, Any]]:
+        groups = [
+            item
+            for item in self.db.list_groups(session_id)
+            if not int(item.get("is_channel") or 0) and item.get("speak_status") != "频道跳过"
+        ]
+        groups.sort(key=lambda item: int(item.get("id") or 0))
+        return groups
+
+    def group_page_items(self, session_id: int, page: int = 0) -> tuple[list[dict[str, Any]], int, int, bool]:
         groups = self.managed_groups(session_id)
+        fallback_mode = False
+        if not groups:
+            groups = self.synced_non_channel_groups(session_id)
+            fallback_mode = bool(groups)
         total = len(groups)
         if total <= 0:
-            return [], 0, 0
+            return [], 0, 0, False
         max_page = max(0, (total - 1) // GROUPS_PAGE_SIZE)
         current_page = max(0, min(page, max_page))
         start = current_page * GROUPS_PAGE_SIZE
         end = start + GROUPS_PAGE_SIZE
-        return groups[start:end], total, current_page
+        return groups[start:end], total, current_page, fallback_mode
 
     def group_detail_text(self, group_id: int) -> str:
         group = self.db.get_group(group_id)
