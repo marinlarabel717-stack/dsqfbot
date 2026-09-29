@@ -95,5 +95,44 @@ class GroupListingTests(unittest.TestCase):
         self.assertIn("Recently Synced B", text)
 
 
+    def test_orphan_tasks_are_not_counted_or_listed(self) -> None:
+        with self.db.connect() as conn:
+            conn.execute("PRAGMA foreign_keys=OFF;")
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    session_id, group_id, message_text, schedule_at, repeat_mode,
+                    next_run_at, last_scheduled_for, last_telegram_message_id,
+                    status, last_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self.session_id,
+                    999999,
+                    "stale task",
+                    "2999-01-01T00:00:00+08:00",
+                    "once",
+                    None,
+                    None,
+                    None,
+                    "scheduled",
+                    None,
+                    "2026-01-01T00:00:00+08:00",
+                    "2026-01-01T00:00:00+08:00",
+                ),
+            )
+            conn.commit()
+
+        self.assertEqual(self.db.count_tasks(), 1)
+        self.assertEqual(self.db.count_active_tasks(self.app.active_task_cutoff_iso()), 0)
+
+        tasks, total, current_page = self.app.task_page_items()
+
+        self.assertEqual(tasks, [])
+        self.assertEqual(total, 0)
+        self.assertEqual(current_page, 0)
+        self.assertEqual(self.db.count_tasks(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

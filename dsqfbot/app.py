@@ -258,6 +258,7 @@ class DsqfBotApp:
         )
 
     async def send_home(self, update: Update) -> None:
+        self.prune_stale_task_records()
         sessions = self.db.list_sessions()
         sendable_groups_count = sum(len(self.visible_groups(item["id"])) for item in sessions)
         active_tasks = self.db.count_active_tasks(self.active_task_cutoff_iso())
@@ -2171,6 +2172,11 @@ class DsqfBotApp:
         cutoff = datetime.now(tz=ZoneInfo(self.config.default_timezone)) - timedelta(minutes=1)
         return self.db.delete_completed_once_tasks(cutoff.isoformat())
 
+    def prune_stale_task_records(self) -> int:
+        removed = self.prune_completed_once_tasks()
+        removed += self.db.delete_orphan_tasks()
+        return removed
+
     def active_task_cutoff_iso(self) -> str:
         return datetime.now(tz=ZoneInfo(self.config.default_timezone)).isoformat()
 
@@ -2187,7 +2193,7 @@ class DsqfBotApp:
             return 0
 
     def task_page_items(self, page: int = 0) -> tuple[list[dict[str, Any]], int, int]:
-        self.prune_completed_once_tasks()
+        self.prune_stale_task_records()
         cutoff_iso = self.active_task_cutoff_iso()
         total = self.db.count_active_tasks(cutoff_iso)
         if total <= 0:
@@ -2234,7 +2240,7 @@ class DsqfBotApp:
         return InlineKeyboardMarkup(rows)
 
     def task_detail_text(self, task_id: int) -> str:
-        self.prune_completed_once_tasks()
+        self.prune_stale_task_records()
         item = self.db.get_task(task_id)
         if not item:
             return "任务不存在。"

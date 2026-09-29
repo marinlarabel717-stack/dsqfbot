@@ -499,10 +499,12 @@ class Database:
                 """
                 SELECT COUNT(*) AS total
                 FROM tasks
-                WHERE status='scheduled'
+                JOIN groups ON groups.id = tasks.group_id
+                JOIN sessions ON sessions.id = tasks.session_id
+                WHERE tasks.status='scheduled'
                   AND (
-                    repeat_mode != 'once'
-                    OR schedule_at > ?
+                    tasks.repeat_mode != 'once'
+                    OR tasks.schedule_at > ?
                   )
                 """,
                 (cutoff_iso,),
@@ -579,6 +581,21 @@ class Database:
                 WHERE repeat_mode='once' AND status='scheduled' AND schedule_at <= ?
                 """,
                 (cutoff_iso,),
+            )
+            return int(cur.rowcount or 0)
+
+    def delete_orphan_tasks(self) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM tasks
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM groups WHERE groups.id = tasks.group_id
+                )
+                OR NOT EXISTS (
+                    SELECT 1 FROM sessions WHERE sessions.id = tasks.session_id
+                )
+                """
             )
             return int(cur.rowcount or 0)
 
