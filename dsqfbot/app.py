@@ -1073,7 +1073,7 @@ class DsqfBotApp:
                     return
                 groups = self.visible_groups(session_id)
                 if not groups:
-                    await self.render(update, "这个账号当前没有可检查的在群群组。", self.groups_keyboard(session_id))
+                    await self.render(update, self.sendable_groups_empty_text(session_id), self.groups_keyboard(session_id))
                     return
                 payload = {"session_id": session_id, "target_scope": "sendable_groups"}
                 self.log_schedule_flow("enter_sendable_groups_schedule", user_id, payload, session_row=session_row)
@@ -1491,6 +1491,24 @@ class DsqfBotApp:
         ]
         return groups
 
+    def sendable_groups_empty_text(self, session_id: int) -> str:
+        managed_count = len(self.managed_groups(session_id))
+        synced_count = len(self.synced_non_channel_groups(session_id))
+        if managed_count > 0:
+            return (
+                "这个账号当前没有正常可发的在群群组。\n\n"
+                f"当前在群：{managed_count}\n"
+                "正常可发：0\n\n"
+                "先检查群状态，或先执行“一键退出并隐藏不可发群”再试。"
+            )
+        if synced_count > 0:
+            return (
+                "这个账号当前没有正常可发的在群群组。\n\n"
+                "已同步到群记录，但当前没有判定为“在群”的群。\n"
+                "先点“查看群组”确认状态，必要时重新同步群组后再试。"
+            )
+        return "这个账号当前还没有同步到可用群组，先点“同步群组”再试。"
+
     def synced_non_channel_groups(self, session_id: int) -> list[dict[str, Any]]:
         groups = [
             item
@@ -1733,7 +1751,7 @@ class DsqfBotApp:
         groups = self.visible_groups(session_row["id"])
         if not groups:
             self.db.clear_user_state(user_id)
-            await self.render(update, "这个账号当前没有可检查的在群群组。", self.groups_keyboard(session_row["id"]))
+            await self.render(update, self.sendable_groups_empty_text(session_row["id"]), self.groups_keyboard(session_row["id"]))
             return
 
         repeat_mode = payload["repeat_mode"]

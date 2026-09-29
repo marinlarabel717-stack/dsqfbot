@@ -94,6 +94,39 @@ class GroupListingTests(unittest.TestCase):
         self.assertIn("Recently Synced A", text)
         self.assertIn("Recently Synced B", text)
 
+    def test_sendable_groups_empty_text_explains_non_sendable_groups(self) -> None:
+        self.db.upsert_group(
+            self.session_id,
+            301,
+            "Muted Group",
+            "muted_group",
+            "https://t.me/muted_group",
+            join_status="joined",
+            speak_status="禁言",
+        )
+
+        text = self.app.sendable_groups_empty_text(self.session_id)
+
+        self.assertIn("没有正常可发的在群群组", text)
+        self.assertIn("当前在群：1", text)
+        self.assertIn("正常可发：0", text)
+
+    def test_sendable_groups_empty_text_explains_missing_joined_groups(self) -> None:
+        self.db.upsert_group(
+            self.session_id,
+            302,
+            "Left Group",
+            "left_group",
+            "https://t.me/left_group",
+            join_status="left",
+            speak_status="同步后已移除",
+        )
+
+        text = self.app.sendable_groups_empty_text(self.session_id)
+
+        self.assertIn("没有正常可发的在群群组", text)
+        self.assertIn("没有判定为“在群”的群", text)
+
 
     def test_orphan_tasks_are_not_counted_or_listed(self) -> None:
         with self.db.connect() as conn:
