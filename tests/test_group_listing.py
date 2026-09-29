@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dsqfbot.app import DsqfBotApp
 from dsqfbot.config import AppConfig
@@ -211,6 +213,50 @@ class GroupListingTests(unittest.TestCase):
         self.assertEqual(total, 0)
         self.assertEqual(current_page, 0)
         self.assertEqual(self.db.count_tasks(), 0)
+
+    def test_once_tasks_are_completed_but_not_deleted_after_send_time(self) -> None:
+        group_id = self.db.upsert_group(self.session_id, 501, "Realtime Group", "realtime_group", "https://t.me/realtime_group")
+        now = datetime.now(tz=ZoneInfo(self.app.config.default_timezone))
+        task_id = self.db.create_task(
+            session_id=self.session_id,
+            group_id=group_id,
+            message_text="hello",
+            schedule_at=(now - timedelta(minutes=2)).isoformat(),
+            repeat_mode="once",
+            next_run_at=None,
+            last_scheduled_for=(now - timedelta(minutes=2)).isoformat(),
+            last_telegram_message_id=12345,
+            status="scheduled",
+        )
+
+        removed = self.app.prune_stale_task_records()
+        task = self.db.get_task(task_id)
+
+        self.assertEqual(removed, 1)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(self.db.count_active_tasks(self.app.active_task_cutoff_iso()), 0)
+        self.assertIn("状态：已发出", self.app.task_detail_text(task_id))
+
+    def test_tasks_text_explains_realtime_count_for_once_tasks(self) -> None:
+        group_id = self.db.upsert_group(self.session_id, 502, "Future Group", "future_group", "https://t.me/future_group")
+        now = datetime.now(tz=ZoneInfo(self.app.config.default_timezone))
+        self.db.create_task(
+            session_id=self.session_id,
+            group_id=group_id,
+            message_text="hello future",
+            schedule_at=(now + timedelta(minutes=30)).isoformat(),
+            repeat_mode="once",
+            next_run_at=None,
+            last_scheduled_for=(now + timedelta(minutes=30)).isoformat(),
+            last_telegram_message_id=67890,
+            status="scheduled",
+        )
+
+        text = self.app.tasks_text()
+
+        self.assertIn("点下方“查看任务”后，把任务编号发给我。", text)
+        self.assertIn("单次任务发完后会自动扣减；上面显示的是实时有效条数。", text)
 
 
 if __name__ == "__main__":

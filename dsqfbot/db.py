@@ -577,10 +577,11 @@ class Database:
         with self.connect() as conn:
             cur = conn.execute(
                 """
-                DELETE FROM tasks
+                UPDATE tasks
+                SET status='completed', next_run_at=NULL, updated_at=?
                 WHERE repeat_mode='once' AND status='scheduled' AND schedule_at <= ?
                 """,
-                (cutoff_iso,),
+                (now_iso(), cutoff_iso),
             )
             return int(cur.rowcount or 0)
 

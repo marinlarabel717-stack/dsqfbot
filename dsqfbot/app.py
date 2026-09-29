@@ -2190,7 +2190,7 @@ class DsqfBotApp:
         )
 
     def prune_completed_once_tasks(self) -> int:
-        cutoff = datetime.now(tz=ZoneInfo(self.config.default_timezone)) - timedelta(minutes=1)
+        cutoff = datetime.now(tz=ZoneInfo(self.config.default_timezone))
         return self.db.delete_completed_once_tasks(cutoff.isoformat())
 
     def prune_stale_task_records(self) -> int:
@@ -2229,7 +2229,11 @@ class DsqfBotApp:
         if not tasks:
             return "还没有定时任务。"
         total_pages = max(1, (total + TASKS_PAGE_SIZE - 1) // TASKS_PAGE_SIZE)
-        lines = [f"定时任务列表（第 {current_page + 1}/{total_pages} 页，共 {total} 条）", "点下方“查看任务”后，把任务编号发给我。"]
+        lines = [
+            f"定时任务列表（第 {current_page + 1}/{total_pages} 页，共 {total} 条）",
+            "点下方“查看任务”后，把任务编号发给我。",
+            "单次任务发完后会自动扣减；上面显示的是实时有效条数。",
+        ]
         for item in tasks:
             repeat_text = self.repeat_mode_text(item["repeat_mode"])
             is_daily = self.is_daily_repeat_mode(item["repeat_mode"])
@@ -2265,10 +2269,6 @@ class DsqfBotApp:
         item = self.db.get_task(task_id)
         if not item:
             return "任务不存在。"
-        if item.get("status") == "scheduled" and item.get("repeat_mode") == "once":
-            schedule_at = str(item.get("schedule_at") or "")
-            if schedule_at and schedule_at <= self.active_task_cutoff_iso():
-                return "任务不存在。"
         lines = [
             f"任务 ID：{item['id']}",
             f"账号：{item['session_label']}",
@@ -2353,17 +2353,18 @@ class DsqfBotApp:
     def human_task_status(status: str) -> str:
         return {
             "scheduled": "已设定",
+            "completed": "已发出",
             "cancelled": "已停用",
             "failed": "失败",
         }.get(status, status)
 
     def task_detail_keyboard(self, task_id: int, return_page: int = 0) -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("停用任务", callback_data=f"task:delete:{task_id}:{max(0, return_page)}")],
-                [InlineKeyboardButton("返回任务列表", callback_data=f"tasks:page:{max(0, return_page)}")],
-            ]
-        )
+        task = self.db.get_task(task_id)
+        rows: list[list[InlineKeyboardButton]] = []
+        if task and task.get("status") == "scheduled":
+            rows.append([InlineKeyboardButton("停用任务", callback_data=f"task:delete:{task_id}:{max(0, return_page)}")])
+        rows.append([InlineKeyboardButton("返回任务列表", callback_data=f"tasks:page:{max(0, return_page)}")])
+        return InlineKeyboardMarkup(rows)
 
     async def delete_task(self, task_id: int) -> None:
         task = self.db.get_task(task_id)
