@@ -1071,7 +1071,7 @@ class DsqfBotApp:
                 if not session_row:
                     await self.render(update, "账号不存在。")
                     return
-                groups = self.visible_groups(session_id)
+                groups = self.schedule_candidate_groups(session_id)
                 if not groups:
                     await self.render(update, self.sendable_groups_empty_text(session_id), self.groups_keyboard(session_id))
                     return
@@ -1491,6 +1491,9 @@ class DsqfBotApp:
         ]
         return groups
 
+    def schedule_candidate_groups(self, session_id: int) -> list[dict[str, Any]]:
+        return self.managed_groups(session_id)
+
     def sendable_groups_empty_text(self, session_id: int) -> str:
         managed_count = len(self.managed_groups(session_id))
         synced_count = len(self.synced_non_channel_groups(session_id))
@@ -1748,7 +1751,7 @@ class DsqfBotApp:
         payload: dict[str, Any],
         when: datetime,
     ) -> None:
-        groups = self.visible_groups(session_row["id"])
+        groups = self.schedule_candidate_groups(session_row["id"])
         if not groups:
             self.db.clear_user_state(user_id)
             await self.render(update, self.sendable_groups_empty_text(session_row["id"]), self.groups_keyboard(session_row["id"]))

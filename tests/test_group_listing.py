@@ -128,6 +128,52 @@ class GroupListingTests(unittest.TestCase):
         self.assertIn("没有判定为“在群”的群", text)
 
 
+    def test_schedule_candidate_groups_include_joined_unknown_groups(self) -> None:
+        self.db.upsert_group(
+            self.session_id,
+            401,
+            "Unchecked Group",
+            "unchecked_group",
+            "https://t.me/unchecked_group",
+        )
+        self.db.upsert_group(
+            self.session_id,
+            402,
+            "Channel Record",
+            "channel_record",
+            "https://t.me/channel_record",
+            is_channel=True,
+            speak_status="频道跳过",
+        )
+        self.db.upsert_group(
+            self.session_id,
+            403,
+            "Left Group",
+            "left_group_2",
+            "https://t.me/left_group_2",
+            join_status="left",
+            speak_status="同步后已移除",
+        )
+
+        groups = self.app.schedule_candidate_groups(self.session_id)
+
+        self.assertEqual([item["title"] for item in groups], ["Unchecked Group"])
+
+    def test_schedule_candidate_groups_include_joined_non_sendable_groups(self) -> None:
+        self.db.upsert_group(
+            self.session_id,
+            404,
+            "Muted Group",
+            "muted_group_2",
+            "https://t.me/muted_group_2",
+            join_status="joined",
+            speak_status="禁言",
+        )
+
+        groups = self.app.schedule_candidate_groups(self.session_id)
+
+        self.assertEqual([item["title"] for item in groups], ["Muted Group"])
+
     def test_orphan_tasks_are_not_counted_or_listed(self) -> None:
         with self.db.connect() as conn:
             conn.execute("PRAGMA foreign_keys=OFF;")
